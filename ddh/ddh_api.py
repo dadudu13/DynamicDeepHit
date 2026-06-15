@@ -14,14 +14,7 @@ import random
 last = lambda t: np.array([t_[-1] for t_ in t], dtype = float)
 
 class DynamicDeepHit(DeepRecurrentSurvivalMachines):
-	"""
-		This implementation considers that the last event happen at the same time for each patient
-		The CIF is therefore simplified
-
-		Args:
-			DeepRecurrentSurvivalMachines
-	"""
-
+	
 	def __init__(self, split = 50, layers_rnn = 1, hidden_rnn = 10, typ = 'LSTM',
 		long_param = {}, att_param = {}, cs_param = {},
 		alpha = 0.1, beta = 0.1, sigma = 0.1, cuda = False,
@@ -73,7 +66,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 
 	def fit(self, x, t, e, vsize = 0.15, val_data = None,
 		  iters = 1, learning_rate = 1e-3, batch_size = 100,
-		  optimizer = "Adam", random_state = 100,
+		  optimizer = "Adam", random_state = 100, s = None, s_val = None,
 		  patience_limit = 10, grad_clip_norm = 1.0):
 		random.seed(random_state)
 		np.random.seed(random_state)
@@ -82,10 +75,22 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 			torch.cuda.manual_seed(random_state)
 			torch.cuda.manual_seed_all(random_state)
 		discretized_t, self.split_time = self.discretize(t, self.split, self.split_time)
-		processed_data = self._prepocess_training_data(x, last(discretized_t), last(e),
-													vsize, val_data,
-													random_state)
-		x_train, t_train, e_train, x_val, t_val, e_val = processed_data
+
+		# Discretize landmark times into bin indices now that split_time is known
+		max_bin = self.split - 1
+		s_disc = None if s is None else np.clip(
+			np.digitize(s, self.split_time, right=True) - 1, 0, max_bin
+		)
+		s_val_disc = None if s_val is None else np.clip(
+			np.digitize(s_val, self.split_time, right=True) - 1, 0, max_bin
+		)
+
+		processed_data = self._prepocess_training_data(
+			x, last(discretized_t), last(e),
+			vsize, val_data, random_state,
+			s=s_disc, s_val=s_val_disc,
+		)
+		x_train, t_train, e_train, x_val, t_val, e_val, s_train_tensor, s_val_tensor = processed_data
 		inputdim = x_train.shape[-1]
 
 		maxrisk = int(np.nanmax(e_train.cpu().numpy()))
@@ -99,6 +104,8 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 					lr = learning_rate,
 					bs = batch_size,
 					cuda = self.cuda,
+					s_train = s_train_tensor,
+					s_valid = s_val_tensor,
 					cause_weights = self.cause_weights,
 					patience_limit = patience_limit,
 					grad_clip_norm = grad_clip_norm)
@@ -139,7 +146,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 			data = data.cuda()
 		return data
 
-	def _prepocess_training_data(self, x, t, e, vsize, val_data, random_state):
+	def _prepocess_training_data(self, x, t, e, vsize, val_data, random_state, s=None, s_val=None):
 		"""RNNs require different preprocessing for variable length sequences"""
 
 		idx = list(range(x.shape[0]))
@@ -153,15 +160,24 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		t_train = torch.from_numpy(t_train).double()
 		e_train = torch.from_numpy(e_train).double()
 
+		s_train_tensor, s_val_tensor = None, None
+		if s is not None:
+			s_shuffled = s[np.array(idx)]
+			s_train_tensor = torch.from_numpy(s_shuffled).long()
+
 		if val_data is None:
 
 			vsize = int(vsize*x_train.shape[0])
 
 			x_val, t_val, e_val = x_train[-vsize:], t_train[-vsize:], e_train[-vsize:]
-            
+
 			x_train = x_train[:-vsize]
 			t_train = t_train[:-vsize]
 			e_train = e_train[:-vsize]
+
+			if s_train_tensor is not None:
+				s_val_tensor = s_train_tensor[-vsize:]
+				s_train_tensor = s_train_tensor[:-vsize]
 
 		else:
 
@@ -174,8 +190,12 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 			t_val = torch.from_numpy(last(t_val)).double()
 			e_val = torch.from_numpy(last(e_val)).double()
 
-		return (x_train, t_train, e_train,				
-				x_val, t_val, e_val)
+			if s_val is not None:
+				s_val_tensor = torch.from_numpy(s_val).long()
+
+		return (x_train, t_train, e_train,
+				x_val, t_val, e_val,
+				s_train_tensor, s_val_tensor)
 
 	def compute_nll(self, x, t, e):
 		if not self.fitted:
@@ -184,7 +204,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 									"before calling `_eval_nll`.")
 		discretized_t, _ = self.discretize(t, self.split, self.split_time)
 		processed_data = self._prepocess_training_data(x, last(discretized_t), last(e), 0, None, 0)
-		_, _, _, x_val, t_val, e_val = processed_data
+		_, _, _, x_val, t_val, e_val, _, _ = processed_data
 		return total_loss(self.torch_model, x_val, t_val, e_val, 0, 1, 1).item()
 
 	def predict_survival(self, x, t, risk=1, all_step=False, fill_from_last=False, bs=100):

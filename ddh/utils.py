@@ -13,6 +13,7 @@ def train_ddh(model,
 			  alpha, beta, sigma,
 			  n_iter = 10000, lr = 1e-3,
 			  bs = 100, cuda = False,
+			  s_train = None, s_valid = None,
 			  cause_weights = None,
 			  patience_limit = 10,
 			  grad_clip_norm = 1.0):
@@ -35,21 +36,25 @@ def train_ddh(model,
 		x_ep = x_train[perm]
 		t_ep = t_train[perm]
 		e_ep = e_train[perm]
+		s_ep = s_train[perm] if s_train is not None else None
 
 		model.train()
 		for j in range(0, n_train, bs):
 			xb = x_ep[j : j + bs]
 			tb = t_ep[j : j + bs]
 			eb = e_ep[j : j + bs]
+			sb = s_ep[j : j + bs] if s_ep is not None else None
 
 			if xb.shape[0] == 0:
 				continue
 
 			if cuda:
 				xb, tb, eb = xb.cuda(), tb.cuda(), eb.cuda()
+				if sb is not None:
+					sb = sb.cuda()
 
 			optimizer.zero_grad()
-			loss = total_loss(model, xb, tb, eb, alpha, beta, sigma, cause_weights=cause_weights)
+			loss = total_loss(model, xb, tb, eb, alpha, beta, sigma, s=sb, cause_weights=cause_weights)
 			loss.backward()
 			if grad_clip_norm > 0:
 				nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
@@ -65,14 +70,17 @@ def train_ddh(model,
 				xb = x_valid[j : j + bs]
 				tb = t_valid[j : j + bs]
 				eb = e_valid[j : j + bs]
+				sb = s_valid[j : j + bs] if s_valid is not None else None
 
 				if xb.shape[0] == 0:
 					continue
 
 				if cuda:
 					xb, tb, eb = xb.cuda(), tb.cuda(), eb.cuda()
+					if sb is not None:
+						sb = sb.cuda()
 
-				valid_loss += total_loss(model, xb, tb, eb, alpha, beta, sigma, cause_weights=cause_weights).item()
+				valid_loss += total_loss(model, xb, tb, eb, alpha, beta, sigma, s=sb, cause_weights=cause_weights).item()
 				n_val_batches += 1
 
 		# Normalize by batch count so comparisons are consistent across epochs.
