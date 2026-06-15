@@ -63,7 +63,8 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 
 	def fit(self, x, t, e, vsize = 0.15, val_data = None,
 		  iters = 1, learning_rate = 1e-3, batch_size = 100,
-		  optimizer = "Adam", random_state = 100):
+		  optimizer = "Adam", random_state = 100,
+		  patience_limit = 10, grad_clip_norm = 1.0):
 		discretized_t, self.split_time = self.discretize(t, self.split, self.split_time)
 		processed_data = self._prepocess_training_data(x, last(discretized_t), last(e),
 													vsize, val_data,
@@ -77,17 +78,19 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		model = train_ddh(model,
 					x_train, t_train, e_train,
 					x_val, t_val, e_val,
-					self.alpha, self.beta, self.sigma, 
+					self.alpha, self.beta, self.sigma,
 					n_iter = iters,
 					lr = learning_rate,
 					bs = batch_size,
-					cuda = self.cuda)
+					cuda = self.cuda,
+					patience_limit = patience_limit,
+					grad_clip_norm = grad_clip_norm)
 
 		self.torch_model = model.eval()
 		self.fitted = True
 		self.cpu()
 
-		return self  
+		return self
 
 	def discretize(self, t, split, split_time = None):
 		"""
