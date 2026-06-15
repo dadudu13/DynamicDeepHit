@@ -17,23 +17,39 @@ def negative_log_likelihood(outcomes, cif, t, e):
     loss += torch.sum(torch.log(1 - censored_cif + 1e-10))
     return - loss / len(outcomes)
 
-def ranking_loss(cif, t, e, sigma):
+def ranking_loss(cif, t, e, sigma, cause_weights=None):
     """
         Penalize wrong ordering of probability
         Equivalent to a C Index
         This function is used to penalize wrong ordering in the survival prediction
-    """
-    loss = 0
-    # Data ordered by time
-    for k, cifk in enumerate(cif):
-        for ci, ti in zip(cifk[e-1 == k], t[e-1 == k]):
-            # For all events: all patients that didn't experience event before
-            # must have a lower risk for that cause
-            if torch.sum(t > ti) > 0:
-                # TODO: When data are sorted in time -> wan we make it even faster ?
-                loss += torch.mean(torch.exp((cifk[t > ti][torch.arange((t > ti).sum()), ti] - ci[ti]) / sigma))
 
-    return loss / len(cif)
+        cause_weights: list of K non-negative floats (alpha_k in the DDH paper)
+           scaling each cause's ranking contribution. Defaults to equal weights
+           1/K. Increase a cause's weight to prioritise its ranking accuracy
+           (e.g. [0.8, 0.2] to penalise wrong VTE ordering more than death).
+
+        Uses torch.sum over valid pairs per the DDH paper (Σ_{i≠j}).
+        Because the sum scales with batch size, set alpha in total_loss small
+        (e.g. 0.01-0.05) or increase sigma to keep the total loss stable.
+    """
+    K = len(cif)
+    if cause_weights is None:
+        cause_weights = [1.0 / K] * K
+
+    loss = 0
+    for k, cifk in enumerate(cif):
+        mask = e - 1 == k
+        cause_loss = 0
+        for ci, ti in zip(cifk[mask], t[mask]):
+            # Eligible comparators: all patients still event-free at t_i
+            eligible = t > ti
+            if eligible.sum() > 0:
+                risk_j = cifk[eligible][torch.arange(eligible.sum()), ti]
+                # Sum over all valid pairs per DDH paper formulation.
+                cause_loss += torch.sum(torch.exp((risk_j - ci[ti]) / sigma))
+        loss += cause_weights[k] * cause_loss
+
+    return loss
 
 def longitudinal_loss(longitudinal_prediction, x):
     """
@@ -64,7 +80,7 @@ def longitudinal_loss(longitudinal_prediction, x):
 
     return torch.nn.MSELoss(reduction = 'mean')(longitudinal_prediction[prediction_mask], x[observation_mask])
 
-def total_loss(model, x, t, e, alpha, beta, sigma):
+def total_loss(model, x, t, e, alpha, beta, sigma, cause_weights=None):
     longitudinal_prediction, outcomes = model(x)
     t, e = t.long(), e.int()
 
@@ -72,5 +88,5 @@ def total_loss(model, x, t, e, alpha, beta, sigma):
     cif = [torch.cumsum(ok, 1) for ok in outcomes]
 
     return (1 - alpha - beta) * longitudinal_loss(longitudinal_prediction, x) +\
-              alpha * ranking_loss(cif, t, e, sigma) +\
+              alpha * ranking_loss(cif, t, e, sigma, cause_weights=cause_weights) +\
               beta * negative_log_likelihood(outcomes, cif, t, e)

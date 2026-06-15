@@ -13,6 +13,7 @@ def train_ddh(model,
 			  alpha, beta, sigma,
 			  n_iter = 10000, lr = 1e-3,
 			  bs = 100, cuda = False,
+			  cause_weights = None,
 			  patience_limit = 10,
 			  grad_clip_norm = 1.0):
 
@@ -48,7 +49,7 @@ def train_ddh(model,
 				xb, tb, eb = xb.cuda(), tb.cuda(), eb.cuda()
 
 			optimizer.zero_grad()
-			loss = total_loss(model, xb, tb, eb, alpha, beta, sigma)
+			loss = total_loss(model, xb, tb, eb, alpha, beta, sigma, cause_weights=cause_weights)
 			loss.backward()
 			if grad_clip_norm > 0:
 				nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
@@ -71,7 +72,7 @@ def train_ddh(model,
 				if cuda:
 					xb, tb, eb = xb.cuda(), tb.cuda(), eb.cuda()
 
-				valid_loss += total_loss(model, xb, tb, eb, alpha, beta, sigma).item()
+				valid_loss += total_loss(model, xb, tb, eb, alpha, beta, sigma, cause_weights=cause_weights).item()
 				n_val_batches += 1
 
 		# Normalize by batch count so comparisons are consistent across epochs.
