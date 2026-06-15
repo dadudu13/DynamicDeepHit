@@ -31,7 +31,7 @@ def ranking_loss(cif, t, e, sigma):
             # must have a lower risk for that cause
             if torch.sum(t > ti) > 0:
                 # TODO: When data are sorted in time -> wan we make it even faster ?
-                loss += torch.mean(torch.exp((cifk[t > ti][torch.arange((t > ti).sum()), ti] - ci[ti])) / sigma)
+                loss += torch.mean(torch.exp((cifk[t > ti][torch.arange((t > ti).sum()), ti] - ci[ti]) / sigma))
 
     return loss / len(cif)
 
