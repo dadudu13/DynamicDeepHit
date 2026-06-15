@@ -1,1 +1,1 @@
-from ddh.ddh_api import DynamicDeepHit
+from .ddh_api import DynamicDeepHit
