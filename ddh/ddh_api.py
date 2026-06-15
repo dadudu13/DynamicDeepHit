@@ -103,7 +103,14 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		"""
 		if split_time is None:
 			_, split_time = np.histogram(np.concatenate(t), split - 1)
-		t_discretized = np.array([np.digitize(t_, split_time, right = True) - 1 for t_ in t], dtype = object)
+		max_bin = len(split_time) - 2
+		t_discretized = np.array(
+			[
+				np.clip(np.digitize(t_, split_time, right = True) - 1, 0, max_bin)
+				for t_ in t
+			],
+			dtype = object
+		)
 		return t_discretized, split_time
 
 	def _prepocess_test_data(self, x):
