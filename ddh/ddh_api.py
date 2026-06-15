@@ -9,6 +9,7 @@ from ddh.utils import train_ddh
 from ddh.losses import total_loss
 import numpy as np
 import torch
+import random
 
 last = lambda t: np.array([t_[-1] for t_ in t], dtype = float)
 
@@ -65,6 +66,12 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		  iters = 1, learning_rate = 1e-3, batch_size = 100,
 		  optimizer = "Adam", random_state = 100,
 		  patience_limit = 10, grad_clip_norm = 1.0):
+		random.seed(random_state)
+		np.random.seed(random_state)
+		torch.manual_seed(random_state)
+		if torch.cuda.is_available():
+			torch.cuda.manual_seed(random_state)
+			torch.cuda.manual_seed_all(random_state)
 		discretized_t, self.split_time = self.discretize(t, self.split, self.split_time)
 		processed_data = self._prepocess_training_data(x, last(discretized_t), last(e),
 													vsize, val_data,
