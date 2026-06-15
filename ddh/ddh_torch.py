@@ -19,14 +19,13 @@ class DynamicDeepHitTorch(nn.Module):
 		# RNN model for longitudinal data
 		if self.typ == 'LSTM':
 			self.embedding = nn.LSTM(input_dim, hidden_rnn, layers_rnn,
-								bias=False, batch_first=True)
+								batch_first=True)
 		if self.typ == 'RNN':
 			self.embedding = nn.RNN(input_dim, hidden_rnn, layers_rnn,
-								bias=False, batch_first=True,
-								nonlinearity='relu')
+								batch_first=True, nonlinearity='relu')
 		if self.typ == 'GRU':
 			self.embedding = nn.GRU(input_dim, hidden_rnn, layers_rnn,
-								bias=False, batch_first=True)
+								batch_first=True)
 
 		# Longitudinal network
 		self.longitudinal = create_nn(hidden_rnn, input_dim, no_activation_last = True, **long_param)
