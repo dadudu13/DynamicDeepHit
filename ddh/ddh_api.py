@@ -24,7 +24,8 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 
 	def __init__(self, split = 50, layers_rnn = 1, hidden_rnn = 10, typ = 'LSTM',
 		long_param = {}, att_param = {}, cs_param = {},
-		alpha = 0.1, beta = 0.1, sigma = 0.1, cuda = False):
+		alpha = 0.1, beta = 0.1, sigma = 0.1, cuda = False,
+		cancer_vocab_size = None, cancer_embedding_dim = None, cancer_id_col = None):
 
 		if isinstance(split, int):
 			self.split = split
@@ -44,6 +45,9 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		self.alpha = alpha
 		self.beta = beta
 		self.sigma = sigma
+		self.cancer_vocab_size = cancer_vocab_size
+		self.cancer_embedding_dim = cancer_embedding_dim
+		self.cancer_id_col = cancer_id_col
 
 		self.cuda = cuda
 		self.fitted = False
@@ -51,7 +55,10 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 	def _gen_torch_model(self, inputdim, optimizer, risks):
 		model = DynamicDeepHitTorch(inputdim, self.split, self.layers_rnn, self.hidden_rnn,
 				long_param = self.long_param, att_param = self.att_param, cs_param = self.cs_param,
-				typ = self.typ, optimizer = optimizer, risks = risks).double()
+				typ = self.typ, optimizer = optimizer, risks = risks,
+				cancer_vocab_size = self.cancer_vocab_size,
+				cancer_embedding_dim = self.cancer_embedding_dim,
+				cancer_id_col = self.cancer_id_col).double()
 		if self.cuda:
 			model = model.cuda()
 		return model
