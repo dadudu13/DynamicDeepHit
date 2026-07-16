@@ -77,7 +77,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		discretized_t, self.split_time = self.discretize(t, self.split, self.split_time)
 
 		# Discretize landmark times into bin indices now that split_time is known
-		max_bin = self.split - 1
+		max_bin = len(self.split_time) - 2
 		s_disc = None if s is None else np.clip(
 			np.digitize(s, self.split_time, right=True) - 1, 0, max_bin
 		)
