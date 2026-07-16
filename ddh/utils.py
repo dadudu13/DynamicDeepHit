@@ -62,29 +62,19 @@ def train_ddh(model,
 
 		# Validation — skip gradient tracking to save memory and compute.
 		model.eval()
-		n_val = x_valid.shape[0]
-		valid_loss = 0.0
-		n_val_batches = 0
 		with torch.no_grad():
-			for j in range(0, n_val, bs):
-				xb = x_valid[j : j + bs]
-				tb = t_valid[j : j + bs]
-				eb = e_valid[j : j + bs]
-				sb = s_valid[j : j + bs] if s_valid is not None else None
+			xb, tb, eb = x_valid, t_valid, e_valid
+			sb = s_valid
 
-				if xb.shape[0] == 0:
-					continue
+			if cuda:
+				xb, tb, eb = xb.cuda(), tb.cuda(), eb.cuda()
+				if sb is not None:
+					sb = sb.cuda()
 
-				if cuda:
-					xb, tb, eb = xb.cuda(), tb.cuda(), eb.cuda()
-					if sb is not None:
-						sb = sb.cuda()
-
-				valid_loss += total_loss(model, xb, tb, eb, alpha, beta, sigma, s=sb, cause_weights=cause_weights).item()
-				n_val_batches += 1
-
-		# Normalize by batch count so comparisons are consistent across epochs.
-		valid_loss /= max(n_val_batches, 1)
+			valid_loss = total_loss(
+				model, xb, tb, eb, alpha, beta, sigma,
+				s=sb, cause_weights=cause_weights
+			).item()
 		scheduler.step(valid_loss)
 
 		if valid_loss < old_loss:
