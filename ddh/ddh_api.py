@@ -197,15 +197,21 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 				x_val, t_val, e_val,
 				s_train_tensor, s_val_tensor)
 
-	def compute_nll(self, x, t, e):
+	def compute_nll(self, x, t, e, s=None):
 		if not self.fitted:
 			raise Exception("The model has not been fitted yet. Please fit the " +
 									"model using the `fit` method on some training data " +
 									"before calling `_eval_nll`.")
 		discretized_t, _ = self.discretize(t, self.split, self.split_time)
-		processed_data = self._prepocess_training_data(x, last(discretized_t), last(e), 0, None, 0)
-		_, _, _, x_val, t_val, e_val, _, _ = processed_data
-		return total_loss(self.torch_model, x_val, t_val, e_val, 0, 1, 1).item()
+		max_bin = len(self.split_time) - 2
+		s_disc = None if s is None else np.clip(
+			np.digitize(s, self.split_time, right=True) - 1, 0, max_bin
+		)
+		processed_data = self._prepocess_training_data(
+			x, last(discretized_t), last(e), 0, None, 0, s=s_disc
+		)
+		_, _, _, x_val, t_val, e_val, _, s_val = processed_data
+		return total_loss(self.torch_model, x_val, t_val, e_val, 0, 1, 1, s=s_val).item()
 
 	def predict_survival(self, x, t, risk=1, all_step=False, fill_from_last=False, bs=100):
 		"""Predict survival function for the given data.
