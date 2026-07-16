@@ -87,7 +87,7 @@ def ranking_loss(cif, t, e, sigma, s=None, cause_weights=None):
 
     return loss
 
-def longitudinal_loss(longitudinal_prediction, x):
+def longitudinal_loss(longitudinal_prediction, x, cancer_id_col=None):
     """
         Penalize error in the longitudinal predictions
         This function is used to compute the error made by the RNN
@@ -114,7 +114,11 @@ def longitudinal_loss(longitudinal_prediction, x):
     observation_mask = index <= length.unsqueeze(1).repeat(1, x.size(1))
     observation_mask[:, 0] = False # Remove first observation
 
-    return torch.nn.MSELoss(reduction = 'mean')(longitudinal_prediction[prediction_mask], x[observation_mask])
+    if cancer_id_col is not None:
+        x_target = torch.cat([x[:, :, :cancer_id_col], x[:, :, cancer_id_col + 1:]], dim=2)
+    else:
+        x_target = x
+    return torch.nn.MSELoss(reduction = 'mean')(longitudinal_prediction[prediction_mask], x_target[observation_mask])
 
 def total_loss(model, x, t, e, alpha, beta, sigma, s=None, cause_weights=None):
     longitudinal_prediction, outcomes = model(x)
@@ -147,6 +151,7 @@ def total_loss(model, x, t, e, alpha, beta, sigma, s=None, cause_weights=None):
     else:
         cif_ranking = cif
 
-    return (1 - alpha - beta) * longitudinal_loss(longitudinal_prediction, x) +\
+    cancer_id_col = model.cancer_id_col if model.use_cancer_embedding else None
+    return (1 - alpha - beta) * longitudinal_loss(longitudinal_prediction, x, cancer_id_col=cancer_id_col) +\
               alpha * ranking_loss(cif_ranking, t, e, sigma, s=s, cause_weights=cause_weights) +\
               beta * negative_log_likelihood(outcomes, cif, t, e, s=s)

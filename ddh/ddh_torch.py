@@ -44,8 +44,9 @@ class DynamicDeepHitTorch(nn.Module):
 			self.embedding = nn.GRU(self.model_input_dim, hidden_rnn, layers_rnn,
 								batch_first=True)
 
-		# Longitudinal network
-		self.longitudinal = create_nn(hidden_rnn, input_dim, no_activation_last = True, **long_param)
+		# Longitudinal network — exclude cancer_id_col from target when embedding is active
+		longitudinal_output_dim = input_dim - 1 if self.use_cancer_embedding else input_dim
+		self.longitudinal = create_nn(hidden_rnn, longitudinal_output_dim, no_activation_last = True, **long_param)
 
 		# Attention mechanism
 		self.attention = create_nn(self.model_input_dim + hidden_rnn, 1, no_activation_last = True, **att_param)
