@@ -30,7 +30,7 @@ def negative_log_likelihood(outcomes, cif, t, e, s=None):
             valid_rows = torch.arange(len(s))[valid]
             survival_at_s = (
                 1.0 - torch.stack([cif[k][valid_rows, s[valid]] for k in range(len(cif))]).sum(0)
-            ).clamp(min=1e-10)
+            ).clamp(min=1e-3) # can also use 1e-8 or 1e-6
             loss -= torch.sum(torch.log(survival_at_s))
 
     return - loss / len(outcomes)
