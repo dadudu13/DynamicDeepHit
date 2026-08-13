@@ -114,6 +114,12 @@ def longitudinal_loss(longitudinal_prediction, x, cancer_id_col=None):
     observation_mask = index <= length.unsqueeze(1).repeat(1, x.size(1))
     observation_mask[:, 0] = False # Remove first observation
 
+    # A baseline-only dataset has no next visit to reconstruct.  Returning a
+    # differentiable zero keeps the survival objectives active without asking
+    # MSELoss to reduce an empty tensor (which otherwise returns NaN).
+    if not observation_mask.any():
+        return longitudinal_prediction.sum() * 0.0
+
     if cancer_id_col is not None:
         x_target = torch.cat([x[:, :, :cancer_id_col], x[:, :, cancer_id_col + 1:]], dim=2)
     else:
