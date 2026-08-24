@@ -120,7 +120,8 @@ def landmark_nll_loss(model, x_exp, t_exp, e_exp, s_exp, weight):
         reduces to negative_log_likelihood exactly when every patient contributes
         a single (final-visit) landmark.  Rows whose landmark bin is at or beyond
         the patient's event bin carry no information about the remaining horizon
-        and are dropped.
+        and are dropped; the 1 / V_i weight is deliberately left as-is, so those
+        few patients (0.5% of rows on the VTE cohort) count slightly under 1.
     """
     _, outcomes = model(x_exp)
     cif = [torch.cumsum(ok, 1) for ok in outcomes]
