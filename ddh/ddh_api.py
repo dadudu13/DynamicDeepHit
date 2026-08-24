@@ -68,7 +68,9 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		  iters = 1, learning_rate = 1e-3, batch_size = 100,
 		  optimizer = "Adam", random_state = 100, s = None, s_val = None,
 		  patience_limit = 10, grad_clip_norm = 1.0,
-		  visit_days = None, landmark_augment_prob = 0.0):
+		  visit_days = None, landmark_augment_prob = 0.0,
+		  visit_days_val = None, all_landmark_nll = False,
+		  landmark_chunk_rows = 512):
 		random.seed(random_state)
 		np.random.seed(random_state)
 		torch.manual_seed(random_state)
@@ -86,13 +88,29 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 			np.digitize(s_val, self.split_time, right=True) - 1, 0, max_bin
 		)
 
+		if all_landmark_nll and visit_days is None:
+			raise ValueError("all_landmark_nll=True requires visit_days")
+
 		processed_data = self._prepocess_training_data(
 			x, last(discretized_t), last(e),
 			vsize, val_data, random_state,
 			s=s_disc, s_val=s_val_disc, visit_days=visit_days,
+			visit_days_val=visit_days_val,
 		)
 		(x_train, t_train, e_train, x_val, t_val, e_val,
-		 s_train_tensor, s_val_tensor, visit_days_train_tensor) = processed_data
+		 s_train_tensor, s_val_tensor,
+		 visit_days_train_tensor, visit_days_val_tensor) = processed_data
+
+		# Landmark bin of *every* timestep (not just the last observation), used
+		# by the all-landmark survival objective.
+		s_all_train = s_all_val = None
+		if all_landmark_nll:
+			s_all_train = self._visit_day_bins(visit_days_train_tensor)
+			if visit_days_val_tensor is None:
+				raise ValueError(
+					"all_landmark_nll=True with external val_data requires visit_days_val"
+				)
+			s_all_val = self._visit_day_bins(visit_days_val_tensor)
 		inputdim = x_train.shape[-1]
 
 		maxrisk = int(np.nanmax(e_train.cpu().numpy()))
@@ -113,7 +131,11 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 					grad_clip_norm = grad_clip_norm,
 					visit_days_train = visit_days_train_tensor,
 					split_time = self.split_time,
-					landmark_augment_prob = landmark_augment_prob)
+					landmark_augment_prob = landmark_augment_prob,
+					s_all_train = s_all_train,
+					s_all_valid = s_all_val,
+					all_landmark_nll = all_landmark_nll,
+					landmark_chunk_rows = landmark_chunk_rows)
 
 		self.torch_model = model.eval()
 		self.fitted = True
@@ -145,13 +167,28 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		)
 		return t_discretized, split_time
 
+	def _visit_day_bins(self, padded_days):
+		"""
+			Map a padded [N, T] array of per-visit elapsed days to landmark bin
+			indices, using the same digitisation as the per-patient `s` in fit()
+			so a patient's last visit gets the identical bin either way.
+			Padded (NaN) positions bin to 0 and are never indexed.
+		"""
+		days = padded_days.detach().cpu().numpy()
+		max_bin = len(self.split_time) - 2
+		bins = np.clip(
+			np.digitize(np.nan_to_num(days, nan = 0.0), self.split_time, right = True) - 1,
+			0, max_bin,
+		)
+		return torch.from_numpy(bins).long()
+
 	def _prepocess_test_data(self, x):
 		data = torch.from_numpy(_get_padded_features(x))
 		if self.cuda:
 			data = data.cuda()
 		return data
 
-	def _prepocess_training_data(self, x, t, e, vsize, val_data, random_state, s=None, s_val=None, visit_days=None):
+	def _prepocess_training_data(self, x, t, e, vsize, val_data, random_state, s=None, s_val=None, visit_days=None, visit_days_val=None):
 		"""RNNs require different preprocessing for variable length sequences"""
 
 		idx = list(range(x.shape[0]))
@@ -172,7 +209,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 
 		# Per-timestep elapsed-day, used only to re-bin `s` when a sequence is
 		# truncated for landmark augmentation during training (see train_ddh).
-		visit_days_train_tensor = None
+		visit_days_train_tensor, visit_days_val_tensor = None, None
 		if visit_days is not None:
 			visit_days_padded = _get_padded_targets(visit_days)[np.array(idx), :, 0]
 			visit_days_train_tensor = torch.from_numpy(visit_days_padded).double()
@@ -192,6 +229,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 				s_train_tensor = s_train_tensor[:-vsize]
 
 			if visit_days_train_tensor is not None:
+				visit_days_val_tensor = visit_days_train_tensor[-vsize:]
 				visit_days_train_tensor = visit_days_train_tensor[:-vsize]
 
 		else:
@@ -208,10 +246,15 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 			if s_val is not None:
 				s_val_tensor = torch.from_numpy(s_val).long()
 
+			if visit_days_val is not None:
+				visit_days_val_tensor = torch.from_numpy(
+					_get_padded_targets(visit_days_val)[:, :, 0]
+				).double()
+
 		return (x_train, t_train, e_train,
 				x_val, t_val, e_val,
 				s_train_tensor, s_val_tensor,
-				visit_days_train_tensor)
+				visit_days_train_tensor, visit_days_val_tensor)
 
 	def compute_nll(self, x, t, e, s=None):
 		if not self.fitted:
@@ -226,7 +269,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		processed_data = self._prepocess_training_data(
 			x, last(discretized_t), last(e), 0, None, 0, s=s_disc
 		)
-		_, _, _, x_val, t_val, e_val, _, s_val, _ = processed_data
+		_, _, _, x_val, t_val, e_val, _, s_val, _, _ = processed_data
 		return total_loss(self.torch_model, x_val, t_val, e_val, 0, 1, 1, s=s_val).item()
 
 	def predict_survival(self, x, t, risk=1, all_step=False, fill_from_last=False, bs=100):
