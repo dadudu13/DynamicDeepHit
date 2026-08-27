@@ -1,3 +1,5 @@
+from typing import NamedTuple
+
 import torch
 
 SURVIVAL_FLOOR = 1e-3
@@ -109,7 +111,7 @@ def build_landmark_prefixes(x, s_all):
 
     return x_exp, s_exp, patient_idx, weight
 
-def landmark_nll_loss(model, x_exp, t_exp, e_exp, s_exp, weight):
+def landmark_nll_from_outcomes(outcomes, cif, t_exp, e_exp, s_exp, weight):
     """
         Conditional survival NLL evaluated at every landmark, averaged within a
         patient before being summed across patients:
@@ -122,13 +124,22 @@ def landmark_nll_loss(model, x_exp, t_exp, e_exp, s_exp, weight):
         the patient's event bin carry no information about the remaining horizon
         and are dropped; the 1 / V_i weight is deliberately left as-is, so those
         few patients (0.5% of rows on the VTE cohort) count slightly under 1.
+
+        Takes the model outputs rather than the model so a caller that also needs
+        the ranking term can pay for one forward pass instead of two.
     """
-    _, outcomes = model(x_exp)
-    cif = [torch.cumsum(ok, 1) for ok in outcomes]
     log_lik = log_likelihood_per_sample(outcomes, cif, t_exp, e_exp, s = s_exp)
 
     usable = (s_exp < t_exp).double()
     return - (log_lik * weight * usable).sum() / len(outcomes)
+
+def landmark_nll_loss(model, x_exp, t_exp, e_exp, s_exp, weight):
+    """
+        landmark_nll_from_outcomes on the model's own forward pass over x_exp.
+    """
+    _, outcomes = model(x_exp)
+    cif = [torch.cumsum(ok, 1) for ok in outcomes]
+    return landmark_nll_from_outcomes(outcomes, cif, t_exp, e_exp, s_exp, weight)
 
 def ranking_loss(cif, t, e, sigma, s=None, cause_weights=None):
     """
@@ -221,40 +232,143 @@ def longitudinal_loss(longitudinal_prediction, x, cancer_id_col=None):
         x_target = x
     return torch.nn.MSELoss(reduction = 'mean')(longitudinal_prediction[prediction_mask], x_target[observation_mask])
 
-def total_loss(model, x, t, e, alpha, beta, sigma, s=None, cause_weights=None, include_nll=True):
+def conditional_cif(cif, s):
+    """
+        CIF re-based on survival past each row's landmark:
+
+            F̂_k(u | s) = (F_k(u) - F_k(s)) / (1 - sum_k F_k(s))
+
+        applied only to rows with s > 0 — rows at s = 0 have no prior observation
+        window, and conditioning there risks dividing by near-zero survival during
+        early training, the same collapse the NLL term guards against.  With
+        s = None the CIF is returned unchanged.
+    """
+    if s is None:
+        return cif
+
+    valid = s > 0
+    if not valid.any():
+        return cif
+
+    rows = torch.arange(cif[0].shape[0], device = cif[0].device)
+    valid_rows = rows[valid]
+    survival_at_s = (
+        1.0 - torch.stack([c[valid_rows, s[valid]] for c in cif]).sum(0)
+    ).clamp(min=1e-8)
+    cif_ranking = []
+    for c in cif:
+        c_rank = c.clone()
+        c_rank[valid] = (
+            (c[valid] - c[valid_rows, s[valid]][:, None]) / survival_at_s[:, None]
+        ).clamp(0.0, 1.0)
+        cif_ranking.append(c_rank)
+    return cif_ranking
+
+class RankRows(NamedTuple):
+    """
+        One side of the ranking comparison: rows carrying a conditional CIF, an
+        outcome, a landmark, and a weight.  A row is a (patient, landmark) pair,
+        so `patient` is what identifies the person — several rows can share it.
+    """
+    cif: list      # K tensors [N, bins], already conditioned on each row's landmark
+    t: torch.Tensor # [N] event / censoring bin
+    s: torch.Tensor # [N] landmark bin
+    e: torch.Tensor # [N] 0 = censored, k + 1 = cause k
+    weight: torch.Tensor  # [N] 1 / V_i
+    patient: torch.Tensor # [N] index of the patient the row came from
+
+    @property
+    def r(self):
+        """Remaining time from the row's landmark to its event/censoring bin."""
+        return self.t - self.s
+
+def weighted_ranking_loss(cases, comparators, sigma, cause_weights=None):
+    """
+        ranking_loss generalised to weighted (patient, landmark) rows:
+
+            L = sum_k a_k sum_{i: e_i = k+1} sum_{j: r_j > r_i, pid_j != pid_i}
+                    w_i w_j exp( (F̂_k,j(s_j + r_i) - F̂_k,i(t_i)) / sigma )
+
+        Two differences from ranking_loss, both consequences of a patient now
+        appearing as several rows:
+
+        * `w_i w_j`.  With w = 1 / V_i the weights of one patient's rows sum to 1
+          on each side, so the number of effective (patient, patient) pairs — and
+          therefore the magnitude of the term — matches the final-visit ranking
+          loss.  That is what lets alpha keep its tuned scale.
+        * `pid_j != pid_i`.  Two landmarks of the same patient share an event bin
+          and differ only in s, so one would be a valid "comparator" for the other
+          under r_j > r_i.  Ranking a patient against themselves is not a
+          discrimination signal, so those pairs are dropped.
+
+        Cases with r_i <= 0 (a landmark at or past the event bin) are dropped, the
+        same rule landmark_nll_from_outcomes applies.
+
+        `cases` and `comparators` are RankRows and may be the same object; passing
+        different ones lets a caller take the gradient through one side at a time.
+
+        Vectorised over pairs, unlike ranking_loss, because the expansion makes
+        the per-case Python loop the dominant cost.
+    """
+    K = len(cases.cif)
+    if cause_weights is None:
+        cause_weights = [1.0 / K] * K
+
+    n_bins = comparators.cif[0].shape[1]
+    comp_rows = torch.arange(
+        comparators.cif[0].shape[0], device = comparators.cif[0].device
+    )
+    r_j = comparators.r
+
+    loss = cases.cif[0].sum() * 0.0
+    for k in range(K):
+        mask = (cases.e.long() - 1 == k) & (cases.r > 0)
+        idx = mask.nonzero(as_tuple = True)[0]
+        if idx.numel() == 0:
+            continue
+
+        r_i = cases.r[idx]
+        # Case's own conditional risk at its event bin: F̂_k,i(t_i), shape [C, 1].
+        risk_i = cases.cif[k][idx, cases.t[idx]].unsqueeze(1)
+        # Comparator j evaluated r_i units past j's own landmark, shape [C, J].
+        col = (comparators.s.unsqueeze(0) + r_i.unsqueeze(1)).clamp(0, n_bins - 1)
+        risk_j = comparators.cif[k][comp_rows.unsqueeze(0), col]
+
+        eligible = (r_j.unsqueeze(0) > r_i.unsqueeze(1)) & (
+            comparators.patient.unsqueeze(0) != cases.patient[idx].unsqueeze(1)
+        )
+        pair_weight = cases.weight[idx].unsqueeze(1) * comparators.weight.unsqueeze(0)
+
+        loss = loss + cause_weights[k] * (
+            torch.exp((risk_j - risk_i) / sigma) * pair_weight * eligible
+        ).sum()
+
+    return loss
+
+def total_loss(model, x, t, e, alpha, beta, sigma, s=None, cause_weights=None,
+               include_nll=True, include_rank=True):
     longitudinal_prediction, outcomes = model(x)
     t, e = t.long(), e.int()
 
     # Compute cumulative function from prediced outcomes
     cif = [torch.cumsum(ok, 1) for ok in outcomes]
 
+    cancer_id_col = model.cancer_id_col if model.use_cancer_embedding else None
+    loss = (1 - alpha - beta) * longitudinal_loss(
+        longitudinal_prediction, x, cancer_id_col=cancer_id_col
+    )
+
     # Ranking loss uses the conditional CIF F̂_k for patients with s > 0, and
     # the raw unconditional CIF for patients with s = 0 (no prior window).
-    # Applying conditional CIF at s=0 risks dividing by near-zero survival
-    # during early training and creates the same collapse as in the NLL term.
-    if s is not None:
-        valid = s > 0
-        if valid.any():
-            rows = torch.arange(cif[0].shape[0])
-            valid_rows = rows[valid]
-            survival_at_s = (
-                1.0 - torch.stack([c[valid_rows, s[valid]] for c in cif]).sum(0)
-            ).clamp(min=1e-8)
-            cif_ranking = []
-            for c in cif:
-                c_rank = c.clone()
-                c_rank[valid] = (
-                    (c[valid] - c[valid_rows, s[valid]][:, None]) / survival_at_s[:, None]
-                ).clamp(0.0, 1.0)
-                cif_ranking.append(c_rank)
-        else:
-            cif_ranking = cif
-    else:
-        cif_ranking = cif
-
-    cancer_id_col = model.cancer_id_col if model.use_cancer_embedding else None
-    loss = (1 - alpha - beta) * longitudinal_loss(longitudinal_prediction, x, cancer_id_col=cancer_id_col) +\
-              alpha * ranking_loss(cif_ranking, t, e, sigma, s=s, cause_weights=cause_weights)
+    #
+    # include_rank=False hands the ranking term to the caller the same way
+    # include_nll=False hands over the survival term — used by the all-landmark
+    # objective when it ranks over every (patient, visit) landmark rather than
+    # over the final visits represented in this batch.
+    if include_rank:
+        loss = loss + alpha * ranking_loss(
+            conditional_cif(cif, s), t, e, sigma, s=s, cause_weights=cause_weights
+        )
 
     # include_nll=False keeps the longitudinal/ranking weights untouched while the
     # survival term is supplied elsewhere — used by the all-landmark objective,

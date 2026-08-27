@@ -70,7 +70,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		  patience_limit = 10, grad_clip_norm = 1.0,
 		  visit_days = None, landmark_augment_prob = 0.0,
 		  visit_days_val = None, all_landmark_nll = False,
-		  landmark_chunk_rows = 512):
+		  landmark_chunk_rows = 512, all_landmark_rank = False):
 		random.seed(random_state)
 		np.random.seed(random_state)
 		torch.manual_seed(random_state)
@@ -90,6 +90,8 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 
 		if all_landmark_nll and visit_days is None:
 			raise ValueError("all_landmark_nll=True requires visit_days")
+		if all_landmark_rank and not all_landmark_nll:
+			raise ValueError("all_landmark_rank=True requires all_landmark_nll=True")
 
 		processed_data = self._prepocess_training_data(
 			x, last(discretized_t), last(e),
@@ -135,7 +137,8 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 					s_all_train = s_all_train,
 					s_all_valid = s_all_val,
 					all_landmark_nll = all_landmark_nll,
-					landmark_chunk_rows = landmark_chunk_rows)
+					landmark_chunk_rows = landmark_chunk_rows,
+					all_landmark_rank = all_landmark_rank)
 
 		self.torch_model = model.eval()
 		self.fitted = True

@@ -1,4 +1,6 @@
-from ddh.losses import total_loss, build_landmark_prefixes, landmark_nll_loss
+from ddh.losses import (total_loss, build_landmark_prefixes, landmark_nll_loss,
+                        landmark_nll_from_outcomes, conditional_cif, RankRows,
+                        weighted_ranking_loss)
 from ddh.dsm_compat import get_optimizer, _reshape_tensor_with_nans
 
 import torch
@@ -6,6 +8,7 @@ import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
 from copy import deepcopy
+from torch.utils.checkpoint import checkpoint
 
 def _augment_landmark_truncation(x_ep, s_ep, visit_days_ep, split_time, prob):
 	"""
@@ -38,9 +41,34 @@ def _augment_landmark_truncation(x_ep, s_ep, visit_days_ep, split_time, prob):
 
 	return x_ep, s_ep
 
+def _chunked_outcomes(model, x_exp, chunk_rows, recompute):
+	"""
+		Model outputs for every expanded landmark row, one chunk at a time.
+
+		With recompute=True each chunk's forward is wrapped in a gradient
+		checkpoint: its activations are freed immediately and recomputed during
+		backward, so peak memory tracks `chunk_rows` even though the returned
+		tensors are all live at once.  Checkpointing restores the RNG state
+		before recomputing, so dropout masks match the original forward and the
+		gradient is exact.
+	"""
+	n_rows = x_exp.shape[0]
+	step = n_rows if not chunk_rows or chunk_rows <= 0 else chunk_rows
+	chunks = []
+	for start in range(0, n_rows, step):
+		xc = x_exp[start : start + step]
+		if recompute:
+			outcomes = checkpoint(lambda z: tuple(model(z)[1]), xc,
+								  use_reentrant = False)
+		else:
+			outcomes = model(xc)[1]
+		chunks.append(outcomes)
+	return [torch.cat([c[k] for c in chunks], 0) for k in range(len(chunks[0]))]
+
 def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 						   alpha, beta, sigma, cause_weights,
-						   chunk_rows = 512, backward = False):
+						   chunk_rows = 512, backward = False,
+						   rank_on_landmarks = False):
 	"""
 		Total loss with the survival term evaluated at EVERY landmark instead of
 		only the final visit:
@@ -48,19 +76,33 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 			L = (1-alpha-beta) * L_long + alpha * L_rank
 				+ beta * (1/K) sum_i (1/V_i) sum_v -log P(T_i,K_i | T_i>s_iv, X_i,<=v)
 
-		Longitudinal and ranking losses stay on the full-history rows, so their
-		tuned weights keep the same scale as the final-visit objective and only
-		the beta term changes.  Expanding P patients into sum_i V_i prefix rows
-		multiplies activation memory by the mean visit count, so the expanded
-		rows are processed in chunks of `chunk_rows`; back-propagating each chunk
-		separately is exact because the objective is a plain weighted sum over
-		rows (gradients accumulate in .grad until the caller steps).
+		The longitudinal loss stays on the full-history rows.  So does the ranking
+		loss by default, which keeps alpha at the scale it was tuned at and leaves
+		the beta term as the only change from the final-visit objective.
+		Expanding P patients into sum_i V_i prefix rows multiplies activation
+		memory by the mean visit count, so the expanded rows are processed in
+		chunks of `chunk_rows`; back-propagating each chunk separately is exact
+		because the objective is a plain weighted sum over rows (gradients
+		accumulate in .grad until the caller steps).
+
+		rank_on_landmarks=True moves the ranking term onto the expanded rows too,
+		weighted by the same 1 / V_i:
+
+			L = (1-alpha-beta) * L_long + alpha * L_rank^landmark
+				+ beta * (1/K) sum_i (1/V_i) sum_v -log P(...)
+
+		The ranking term couples every row to every other, so it cannot be summed
+		chunk by chunk the way the NLL can.  The expanded rows are still forwarded
+		in chunks, but through a gradient checkpoint, so `chunk_rows` stays a pure
+		memory knob and the objective is unchanged by it — at the cost of a second
+		forward pass during backward.
 
 		Returns the scalar loss value.  With backward=True the caller is
 		responsible for optimizer.zero_grad()/step() around the call.
 	"""
 	main = total_loss(model, xb, tb, eb, alpha, beta, sigma,
-					  s = sb, cause_weights = cause_weights, include_nll = False)
+					  s = sb, cause_weights = cause_weights, include_nll = False,
+					  include_rank = not rank_on_landmarks)
 	if backward:
 		main.backward()
 	total = main.item()
@@ -68,17 +110,32 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 	x_exp, s_exp, patient_idx, weight = build_landmark_prefixes(xb, s_all_b)
 	t_exp, e_exp = tb.long()[patient_idx], eb.int()[patient_idx]
 
-	n_rows = x_exp.shape[0]
-	step = n_rows if not chunk_rows or chunk_rows <= 0 else chunk_rows
-	for start in range(0, n_rows, step):
-		sl = slice(start, start + step)
-		nll = beta * landmark_nll_loss(model, x_exp[sl], t_exp[sl], e_exp[sl],
-									   s_exp[sl], weight[sl])
-		if backward:
-			nll.backward()
-		total += nll.item()
+	if not rank_on_landmarks:
+		n_rows = x_exp.shape[0]
+		step = n_rows if not chunk_rows or chunk_rows <= 0 else chunk_rows
+		for start in range(0, n_rows, step):
+			sl = slice(start, start + step)
+			nll = beta * landmark_nll_loss(model, x_exp[sl], t_exp[sl], e_exp[sl],
+										   s_exp[sl], weight[sl])
+			if backward:
+				nll.backward()
+			total += nll.item()
+		return total
 
-	return total
+	outcomes = _chunked_outcomes(model, x_exp, chunk_rows,
+								 recompute = backward and torch.is_grad_enabled())
+	cif = [torch.cumsum(ok, 1) for ok in outcomes]
+
+	rows = RankRows(cif = conditional_cif(cif, s_exp), t = t_exp, s = s_exp,
+					e = e_exp, weight = weight, patient = patient_idx)
+	survival = (
+		beta * landmark_nll_from_outcomes(outcomes, cif, t_exp, e_exp, s_exp, weight)
+		+ alpha * weighted_ranking_loss(rows, rows, sigma, cause_weights)
+	)
+	if backward:
+		survival.backward()
+
+	return total + survival.item()
 
 def train_ddh(model,
 			  x_train, t_train, e_train,
@@ -96,7 +153,8 @@ def train_ddh(model,
 			  s_all_train = None,
 			  s_all_valid = None,
 			  all_landmark_nll = False,
-			  landmark_chunk_rows = 512):
+			  landmark_chunk_rows = 512,
+			  all_landmark_rank = False):
 
 	optimizer = get_optimizer(model, lr)
 	# Halve LR when val loss plateaus; fires at half the early-stop patience so
@@ -121,6 +179,10 @@ def train_ddh(model,
 			raise ValueError("all_landmark_nll=True requires s_all_train")
 		if augment:
 			raise ValueError("all_landmark_nll=True is incompatible with landmark_augment_prob > 0")
+	# The ranking extension reuses the same (patient, visit) expansion, so it only
+	# makes sense on top of the all-landmark survival term.
+	if all_landmark_rank and not all_landmark_nll:
+		raise ValueError("all_landmark_rank=True requires all_landmark_nll=True")
 
 	for i in tqdm(range(n_iter)):
 		# Re-shuffle every epoch so batch composition varies across epochs.
@@ -157,7 +219,8 @@ def train_ddh(model,
 			if all_landmark_nll:
 				all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 									   alpha, beta, sigma, cause_weights,
-									   chunk_rows = landmark_chunk_rows, backward = True)
+									   chunk_rows = landmark_chunk_rows, backward = True,
+									   rank_on_landmarks = all_landmark_rank)
 			else:
 				loss = total_loss(model, xb, tb, eb, alpha, beta, sigma, s=sb, cause_weights=cause_weights)
 				loss.backward()
@@ -186,6 +249,7 @@ def train_ddh(model,
 					model, xb, tb, eb, sb, s_all_b,
 					alpha, beta, sigma, cause_weights,
 					chunk_rows = landmark_chunk_rows, backward = False,
+					rank_on_landmarks = all_landmark_rank,
 				)
 			else:
 				valid_loss = total_loss(
