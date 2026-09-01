@@ -9,7 +9,7 @@ class DynamicDeepHitTorch(nn.Module):
 				hidden_rnn, long_param = {}, att_param = {}, cs_param = {},
 				typ = 'LSTM', optimizer = 'Adam', risks = 1,
 				cancer_vocab_size = None, cancer_embedding_dim = None,
-				cancer_id_col = None):
+				cancer_id_col = None, hazard = False, hazard_init_survival = 0.5):
 		super(DynamicDeepHitTorch, self).__init__()
 
 		self.input_dim = input_dim
@@ -17,6 +17,13 @@ class DynamicDeepHitTorch(nn.Module):
 		self.optimizer = optimizer
 		self.risks = risks
 		self.typ = typ
+		# hazard=False reproduces the original DeepHit output layer exactly: one
+		# softmax over all (cause, bin) cells, which forces the total probability
+		# of an event inside the grid to 1.  hazard=True instead emits per-bin
+		# cause-specific hazards and converts them to the same (cause, bin)
+		# probability interface, so every downstream consumer is unchanged while
+		# the sum-to-one-over-the-horizon constraint is lifted.  See forward().
+		self.hazard = hazard
 		self.cancer_vocab_size = cancer_vocab_size
 		self.cancer_embedding_dim = cancer_embedding_dim
 		self.cancer_id_col = cancer_id_col
@@ -58,8 +65,35 @@ class DynamicDeepHitTorch(nn.Module):
 			self.cause_specific.append(create_nn(self.model_input_dim + hidden_rnn, output_dim, no_activation_last = True, **cs_param))
 		self.cause_specific = nn.ModuleList(self.cause_specific)
 
+		# Hazard mode adds one more head of the same shape, emitting the "no event
+		# in this bin" logit.  Keeping the cause-specific heads exactly as they are
+		# means the arm isolates the parameterisation change rather than confounding
+		# it with a change in capacity or layer shapes.
+		self.survive = (
+			create_nn(self.model_input_dim + hidden_rnn, output_dim,
+					  no_activation_last = True, **cs_param)
+			if self.hazard else None
+		)
+
+		if self.hazard:
+			# Without this the arm is unrunnable.  A softmax over K+1 outcomes puts
+			# ~1/(K+1) on every hazard at init, so the total per-bin hazard starts
+			# near K/(K+1) and survival collapses geometrically: with K=2 and 102
+			# bins, S(last) ~ 5e-17 before a single gradient step.  The model would
+			# spend its whole budget climbing out of "everyone fails immediately".
+			#
+			# Bias the survive logit so initial survival past the last bin is
+			# hazard_init_survival.  With logits [0, .., 0, c] the per-cause hazard
+			# is 1/(K + e^c), so solving S = (1 - K/(K + e^c))^B for c gives:
+			lam_total = 1.0 - hazard_init_survival ** (1.0 / output_dim)
+			bias = float(np.log(risks * (1.0 - lam_total) / lam_total))
+			final_layer = self.survive[-1]
+			nn.init.zeros_(final_layer.weight)
+			nn.init.constant_(final_layer.bias, bias)
+
 		# Probability
 		self.soft = nn.Softmax(dim = -1) # On all observed output
+		self.bin_soft = nn.Softmax(dim = -1) # Within each bin, over K+1 outcomes
 
 	def forward(self, x):
 		"""
@@ -119,6 +153,30 @@ class DynamicDeepHitTorch(nn.Module):
 		hidden_attentive = torch.cat([hidden_attentive, x_last], 1)
 		for cs_nn in self.cause_specific:
 			outcomes.append(cs_nn(hidden_attentive))
+
+		if self.hazard:
+			# Per-bin competing-risks hazards.  Stack the K cause logits with the
+			# "survive this bin" logit and softmax *within each bin* over K+1
+			# outcomes, so lam[..., k] = P(fail in bin b from cause k | at risk at b)
+			# and lam[..., K] = 1 - sum_k lam[..., k].
+			logits = torch.stack(outcomes + [self.survive(hidden_attentive)], dim = -1)
+			lam = self.bin_soft(logits)                       # [N, B, K+1]
+			hazards = lam[..., :self.risks]                   # [N, B, K]
+			step_survival = lam[..., self.risks]              # [N, B]
+
+			# S(b-1) = prod_{b' < b} (1 - sum_k lam_k(b')), with S(-1) = 1.
+			ones = torch.ones_like(step_survival[:, :1])
+			survival_before = torch.cumprod(
+				torch.cat([ones, step_survival[:, :-1]], dim = 1), dim = 1
+			)                                                 # [N, B]
+
+			# Convert to the same (cause, bin) probability interface the softmax
+			# head produces: P(T = b, K = k) = lam_k(b) * S(b-1).  Cumulative sums
+			# of these are the cause-specific CIFs and 1 - sum_k F_k(b) is S(b),
+			# exactly as before -- but the total no longer has to reach 1 inside
+			# the grid, because the leftover is P(no event by the last bin).
+			pmf = hazards * survival_before.unsqueeze(-1)     # [N, B, K]
+			return longitudinal_prediction, [pmf[:, :, k] for k in range(self.risks)]
 
 		# Soft max for probability distribution
 		outcomes = torch.cat(outcomes, dim = 1)
