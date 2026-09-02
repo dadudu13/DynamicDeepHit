@@ -9,7 +9,8 @@ class DynamicDeepHitTorch(nn.Module):
 				hidden_rnn, long_param = {}, att_param = {}, cs_param = {},
 				typ = 'LSTM', optimizer = 'Adam', risks = 1,
 				cancer_vocab_size = None, cancer_embedding_dim = None,
-				cancer_id_col = None, hazard = False, hazard_init_survival = 0.5):
+				cancer_id_col = None, hazard = False, hazard_init_survival = 0.5,
+				proportional = False):
 		super(DynamicDeepHitTorch, self).__init__()
 
 		self.input_dim = input_dim
@@ -24,6 +25,14 @@ class DynamicDeepHitTorch(nn.Module):
 		# probability interface, so every downstream consumer is unchanged while
 		# the sum-to-one-over-the-horizon constraint is lifted.  See forward().
 		self.hazard = hazard
+		# proportional=True factorises the hazard as
+		#     logit lam_k(b) = alpha_k(b) + beta_k . h
+		# a per-bin baseline plus a SHARED patient score, with "survive" as the
+		# reference category (logit 0).  The free head instead gives every bin its
+		# own 32-dim weight vector, so a patient's risk ordering may change from
+		# bin to bin; measured on the free arm, adjacent-bin hazards are
+		# uncorrelated (lag-1 r = -0.05), i.e. that flexibility fits noise.
+		self.proportional = proportional and hazard
 		self.cancer_vocab_size = cancer_vocab_size
 		self.cancer_embedding_dim = cancer_embedding_dim
 		self.cancer_id_col = cancer_id_col
@@ -61,8 +70,9 @@ class DynamicDeepHitTorch(nn.Module):
 
 		# Cause specific network
 		self.cause_specific = []
+		cs_out = 1 if self.proportional else output_dim
 		for r in range(self.risks):
-			self.cause_specific.append(create_nn(self.model_input_dim + hidden_rnn, output_dim, no_activation_last = True, **cs_param))
+			self.cause_specific.append(create_nn(self.model_input_dim + hidden_rnn, cs_out, no_activation_last = True, **cs_param))
 		self.cause_specific = nn.ModuleList(self.cause_specific)
 
 		# Hazard mode adds one more head of the same shape, emitting the "no event
@@ -72,10 +82,21 @@ class DynamicDeepHitTorch(nn.Module):
 		self.survive = (
 			create_nn(self.model_input_dim + hidden_rnn, output_dim,
 					  no_activation_last = True, **cs_param)
-			if self.hazard else None
+			if self.hazard and not self.proportional else None
 		)
+		# Per-cause, per-bin baseline hazard (the alpha_k(b) above).
+		self.baseline = nn.Parameter(torch.zeros(risks, output_dim)) if self.proportional else None
 
-		if self.hazard:
+		if self.proportional:
+			# With survive as the reference (logit 0) and scores ~0 at init,
+			# lam_k = e^a / (K e^a + 1), so solving S = (1 - K lam)^B gives:
+			lam_total = 1.0 - hazard_init_survival ** (1.0 / output_dim)
+			nn.init.constant_(self.baseline,
+							  float(np.log(lam_total / (risks * (1.0 - lam_total)))))
+			for cs_nn in self.cause_specific:
+				nn.init.zeros_(cs_nn[-1].weight)
+				nn.init.zeros_(cs_nn[-1].bias)
+		elif self.hazard:
 			# Without this the arm is unrunnable.  A softmax over K+1 outcomes puts
 			# ~1/(K+1) on every hazard at init, so the total per-bin hazard starts
 			# near K/(K+1) and survival collapses geometrically: with K=2 and 102
@@ -155,11 +176,19 @@ class DynamicDeepHitTorch(nn.Module):
 			outcomes.append(cs_nn(hidden_attentive))
 
 		if self.hazard:
-			# Per-bin competing-risks hazards.  Stack the K cause logits with the
-			# "survive this bin" logit and softmax *within each bin* over K+1
-			# outcomes, so lam[..., k] = P(fail in bin b from cause k | at risk at b)
-			# and lam[..., K] = 1 - sum_k lam[..., k].
-			logits = torch.stack(outcomes + [self.survive(hidden_attentive)], dim = -1)
+			# Per-bin competing-risks hazards: lam[..., k] = P(fail in bin b from
+			# cause k | at risk at b), and lam[..., K] = 1 - sum_k lam[..., k].
+			if self.proportional:
+				# alpha_k(b) + beta_k . h, with survive pinned to 0 as the
+				# reference category.  Every bin shares one patient score per
+				# cause, so risk ordering is constant across bins.
+				scores = torch.cat(outcomes, dim = 1)                 # [N, K]
+				cause_logits = (self.baseline.unsqueeze(0)            # [1, K, B]
+								+ scores.unsqueeze(-1)).permute(0, 2, 1)  # [N, B, K]
+				reference = torch.zeros_like(cause_logits[..., :1])   # [N, B, 1]
+				logits = torch.cat([cause_logits, reference], dim = -1)
+			else:
+				logits = torch.stack(outcomes + [self.survive(hidden_attentive)], dim = -1)
 			lam = self.bin_soft(logits)                       # [N, B, K+1]
 			hazards = lam[..., :self.risks]                   # [N, B, K]
 			step_survival = lam[..., self.risks]              # [N, B]

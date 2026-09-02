@@ -183,3 +183,69 @@ def test_hazard_init_scales_with_grid_length():
         ).double()
         biases.append(model.survive[-1].bias.detach().mean().item())
     assert biases[1] > biases[0], "bias must grow with the number of bins"
+
+
+def _prop_model(bins=B, target=0.5):
+    torch.manual_seed(0)
+    return DynamicDeepHitTorch(
+        input_dim=D, output_dim=bins, layers_rnn=1, hidden_rnn=5, typ='GRU',
+        risks=K, hazard=True, proportional=True, hazard_init_survival=target,
+        long_param={'layers': [4], 'dropout': 0.0},
+        att_param={'layers': [4], 'dropout': 0.0},
+        cs_param={'layers': [4], 'dropout': 0.0},
+    ).double().eval()
+
+
+def test_proportional_keeps_risk_ordering_constant_across_bins():
+    """The defining property: one shared patient score per cause.
+
+    Under the free head each bin owns a 32-dim weight vector, so the ranking of
+    patients may differ bin to bin.  Under proportionality the ranking must be
+    identical in every bin, because the only patient-dependent term is a scalar
+    added to every bin's baseline.
+    """
+    with torch.no_grad():
+        _, outcomes = _prop_model()(_batch())
+    pmf = torch.stack(outcomes, -1)
+    step = pmf.sum(-1)
+    survival = 1.0 - step.cumsum(1)
+    s_before = torch.cat([torch.ones(N, 1, dtype=torch.float64), survival[:, :-1]], 1)
+    lam_vte = (pmf[:, :, 0] / s_before)                       # [N, B]
+    order = lam_vte.argsort(dim=0)
+    for b in range(1, B):
+        assert torch.equal(order[:, b], order[:, 0]), f"ranking changed at bin {b}"
+
+
+def test_free_head_ranking_may_vary_across_bins():
+    """Contrast: the free head is not constrained this way."""
+    with torch.no_grad():
+        _, outcomes = _model(hazard=True)(_batch())
+    pmf = torch.stack(outcomes, -1)
+    step = pmf.sum(-1)
+    survival = 1.0 - step.cumsum(1)
+    s_before = torch.cat([torch.ones(N, 1, dtype=torch.float64), survival[:, :-1]], 1)
+    order = (pmf[:, :, 0] / s_before).argsort(dim=0)
+    assert any(not torch.equal(order[:, b], order[:, 0]) for b in range(1, B))
+
+
+def test_proportional_has_far_fewer_output_parameters():
+    free, prop = _model(hazard=True), _prop_model()
+    n_free = sum(p.numel() for p in free.parameters())
+    n_prop = sum(p.numel() for p in prop.parameters())
+    assert n_prop < n_free
+    assert prop.survive is None and prop.baseline is not None
+    assert prop.baseline.shape == (K, B)
+
+
+def test_proportional_init_hits_target_survival_exactly():
+    """Cause scores are zeroed at init, so the closed form is exact here."""
+    for bins, target in [(7, 0.5), (102, 0.5), (102, 0.4)]:
+        with torch.no_grad():
+            _, outcomes = _prop_model(bins, target)(_batch())
+        s = 1.0 - torch.stack(outcomes).sum(0).sum(1)
+        assert abs(s.mean().item() - target) < 1e-6, f"B={bins}: {s.mean():.6f}"
+
+
+def test_proportional_still_leaves_mass_outside_the_grid():
+    total = torch.stack(_prop_model()(_batch())[1]).sum(0).sum(1)
+    assert (total < 1.0).all()

@@ -19,7 +19,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		long_param = {}, att_param = {}, cs_param = {},
 		alpha = 0.1, beta = 0.1, sigma = 0.1, cuda = False,
 		cancer_vocab_size = None, cancer_embedding_dim = None, cancer_id_col = None,
-		cause_weights = None, hazard = False):
+		cause_weights = None, hazard = False, proportional = False):
 
 		if isinstance(split, int):
 			self.split = split
@@ -46,6 +46,8 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		# Discrete-time cause-specific hazard output layer (see DynamicDeepHitTorch).
 		# Default False keeps the original DeepHit softmax-over-(cause, bin) head.
 		self.hazard = hazard
+		# Proportional factorisation of the hazard head (see DynamicDeepHitTorch).
+		self.proportional = proportional
 
 		self.cuda = cuda
 		self.fitted = False
@@ -57,7 +59,8 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 				cancer_vocab_size = self.cancer_vocab_size,
 				cancer_embedding_dim = self.cancer_embedding_dim,
 				cancer_id_col = self.cancer_id_col,
-				hazard = self.hazard).double()
+				hazard = self.hazard,
+				proportional = self.proportional).double()
 		if self.cuda:
 			model = model.cuda()
 		return model
