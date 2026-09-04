@@ -75,7 +75,7 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		  iters = 1, learning_rate = 1e-3, batch_size = 100,
 		  optimizer = "Adam", random_state = 100, s = None, s_val = None,
 		  patience_limit = 10, grad_clip_norm = 1.0,
-		  visit_days = None, landmark_augment_prob = 0.0,
+		  visit_days = None, landmark_augment_prob = 0.0, landmark_decay_days = None,
 		  visit_days_val = None, all_landmark_nll = False,
 		  landmark_chunk_rows = 512):
 		random.seed(random_state)
@@ -142,7 +142,9 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 					s_all_train = s_all_train,
 					s_all_valid = s_all_val,
 					all_landmark_nll = all_landmark_nll,
-					landmark_chunk_rows = landmark_chunk_rows)
+					landmark_chunk_rows = landmark_chunk_rows,
+					visit_days_valid = visit_days_val_tensor,
+					landmark_decay_days = landmark_decay_days)
 
 		self.torch_model = model.eval()
 		self.fitted = True
