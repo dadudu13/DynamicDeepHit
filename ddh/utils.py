@@ -41,7 +41,8 @@ def _augment_landmark_truncation(x_ep, s_ep, visit_days_ep, split_time, prob):
 def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 						   alpha, beta, sigma, cause_weights,
 						   chunk_rows = 512, backward = False,
-						   visit_days_b = None, landmark_decay_days = None):
+						   visit_days_b = None, landmark_decay_days = None,
+						   entry_weight_b = None):
 	"""
 		Total loss with the survival term evaluated at EVERY landmark instead of
 		only the final visit:
@@ -67,7 +68,8 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 	total = main.item()
 
 	x_exp, s_exp, patient_idx, weight = build_landmark_prefixes(
-		xb, s_all_b, visit_days = visit_days_b, decay_days = landmark_decay_days)
+		xb, s_all_b, visit_days = visit_days_b, decay_days = landmark_decay_days,
+		entry_weight = entry_weight_b)
 	t_exp, e_exp = tb.long()[patient_idx], eb.int()[patient_idx]
 
 	n_rows = x_exp.shape[0]
@@ -100,7 +102,9 @@ def train_ddh(model,
 			  all_landmark_nll = False,
 			  landmark_chunk_rows = 512,
 			  visit_days_valid = None,
-			  landmark_decay_days = None):
+			  landmark_decay_days = None,
+			  entry_weight_train = None,
+			  entry_weight_valid = None):
 
 	optimizer = get_optimizer(model, lr)
 	# Halve LR when val loss plateaus; fires at half the early-stop patience so
@@ -139,6 +143,7 @@ def train_ddh(model,
 		visit_days_ep = None
 		if augment or landmark_decay_days is not None:
 			visit_days_ep = visit_days_train[perm]
+		entry_w_ep = entry_weight_train[perm] if entry_weight_train is not None else None
 		if augment:
 			x_ep, s_ep = _augment_landmark_truncation(x_ep, s_ep, visit_days_ep, split_time_tensor, landmark_augment_prob)
 
@@ -150,6 +155,7 @@ def train_ddh(model,
 			sb = s_ep[j : j + bs] if s_ep is not None else None
 			s_all_b = s_all_ep[j : j + bs] if s_all_ep is not None else None
 			visit_days_b = visit_days_ep[j : j + bs] if visit_days_ep is not None else None
+			entry_w_b = entry_w_ep[j : j + bs] if entry_w_ep is not None else None
 
 			if xb.shape[0] == 0:
 				continue
@@ -169,7 +175,8 @@ def train_ddh(model,
 									   alpha, beta, sigma, cause_weights,
 									   chunk_rows = landmark_chunk_rows, backward = True,
 									   visit_days_b = visit_days_b,
-									   landmark_decay_days = landmark_decay_days)
+									   landmark_decay_days = landmark_decay_days,
+									   entry_weight_b = entry_w_b)
 			else:
 				loss = total_loss(model, xb, tb, eb, alpha, beta, sigma, s=sb, cause_weights=cause_weights)
 				loss.backward()
@@ -184,6 +191,7 @@ def train_ddh(model,
 			sb = s_valid
 			s_all_b = s_all_valid
 			visit_days_b = visit_days_valid
+			entry_w_b = entry_weight_valid
 
 			if cuda:
 				xb, tb, eb = xb.cuda(), tb.cuda(), eb.cuda()
@@ -203,6 +211,7 @@ def train_ddh(model,
 					chunk_rows = landmark_chunk_rows, backward = False,
 					visit_days_b = visit_days_b,
 					landmark_decay_days = landmark_decay_days,
+					entry_weight_b = entry_w_b,
 				)
 			else:
 				valid_loss = total_loss(

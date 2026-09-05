@@ -297,3 +297,32 @@ def test_decay_weights_by_day_not_visit_index():
     quarterly = _prefix_weights([0.0, 90.0, 180.0, 270.0], decay=180.0)
     assert not torch.allclose(weekly, quarterly)
     assert quarterly[0] > weekly[0], "the sparser schedule concentrates more on visit 1"
+
+
+def test_entry_weight_scales_total_contribution_between_patients():
+    """It must sit OUTSIDE the per-patient normalisation.
+
+    Folded inside, a per-patient constant divides straight back out and the
+    weight does nothing -- a silent no-op that looks like a null result.
+    """
+    from ddh.losses import build_landmark_prefixes
+    x = torch.zeros(2, 3, D, dtype=torch.float64)
+    s_all = torch.zeros(2, 3, dtype=torch.long)
+    vd = torch.tensor([[0., 30., 90.], [0., 30., 90.]], dtype=torch.float64)
+    ew = torch.tensor([1.5, 0.5], dtype=torch.float64)
+
+    _, _, pid, w = build_landmark_prefixes(x, s_all, visit_days=vd,
+                                           decay_days=180.0, entry_weight=ew)
+    tot = torch.tensor([w[pid == i].sum() for i in (0, 1)])
+    assert torch.allclose(tot, ew), f"per-patient totals {tot} should equal {ew}"
+    # shape within a patient is untouched -- only the level differs
+    assert torch.allclose(w[pid == 0] / 1.5, w[pid == 1] / 0.5)
+
+
+def test_entry_weight_applies_without_decay_too():
+    from ddh.losses import build_landmark_prefixes
+    x = torch.zeros(2, 2, D, dtype=torch.float64)
+    s_all = torch.zeros(2, 2, dtype=torch.long)
+    ew = torch.tensor([2.0, 0.25], dtype=torch.float64)
+    _, _, pid, w = build_landmark_prefixes(x, s_all, entry_weight=ew)
+    assert torch.allclose(torch.tensor([w[pid == i].sum() for i in (0, 1)]), ew)

@@ -64,7 +64,8 @@ def negative_log_likelihood(outcomes, cif, t, e, s=None):
     """
     return - log_likelihood_per_sample(outcomes, cif, t, e, s = s).sum() / len(outcomes)
 
-def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None):
+def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
+                            entry_weight=None):
     """
         Expand one row per patient into one row per (patient, visit) landmark.
 
@@ -126,6 +127,15 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None):
         weight = w / totals[patient_idx].clamp(min = 1e-12)
     else:
         weight = (1.0 / lengths.double())[patient_idx]
+
+    if entry_weight is not None:
+        # Applied OUTSIDE the per-patient normalisation, deliberately.  Folded
+        # inside, a per-patient constant divides straight back out and does
+        # nothing at all -- a bug that looks exactly like "the entry weight had
+        # no effect".  Out here it scales the patient's TOTAL contribution, which
+        # is the point: it reweights *between* patients, while the decay term
+        # reweights *within* one.
+        weight = weight * entry_weight.to(weight.dtype)[patient_idx]
 
     return x_exp, s_exp, patient_idx, weight
 
