@@ -350,10 +350,12 @@ def total_loss(model, x, t, e, alpha, beta, sigma, s=None, cause_weights=None, i
 # the true conditional probability at h -- the level, not just the ordering.
 #
 # LABELS AND WEIGHTS mirror V3's evaluation code exactly (Graf/Gerds-Schumacher):
-#     T <= h, cause 1   -> y = 1, weight 1 / G(T-)
-#     T <= h, cause 2   -> y = 0, weight 1 / G(T-)   (death without VTE is a true 0)
-#     T >  h            -> y = 0, weight 1 / G(h)
-#     censored before h -> weight 0                  (status unknown)
+#     T <= h, cause 1   -> y = 1, weight G(s) / G(T-)
+#     T <= h, cause 2   -> y = 0, weight G(s) / G(T-)  (death without VTE is a true 0)
+#     T >  h            -> y = 0, weight G(s) / G(h)
+#     censored before h -> weight 0                    (status unknown)
+# with the G(s) factor conditioning on the landmark, which V3 does not need
+# because it scores one landmark at a time and the factor divides out there.
 # Matching the metric matters more than picking a different defensible estimator:
 # a training term and a reported metric that disagree cannot be read together.
 #
@@ -412,9 +414,10 @@ def horizon_likelihood_loss(outcomes, cif, t, e, s, weight, day, split_time,
             day        : [R] landmark day of each expanded row.
             split_time : [n_bins+1] bin edges, as a tensor.
             g_bins     : [n_bins] censoring survival, from censoring_survival_by_bin.
-            ipcw_clip  : cap on 1/G.  Late landmarks push b_h deep into follow-up
-                         where G is small; uncapped, a handful of rows would carry
-                         most of the gradient.
+            ipcw_clip  : cap on the censoring weight.  With the G(s) factor in
+                         place this practically never binds, and without it
+                         only on a small share of rows.  Kept as a guard for
+                         folds with heavier early censoring.
     """
     n_bins = cif[0].shape[1]
     device = cif[0].device
@@ -444,11 +447,18 @@ def horizon_likelihood_loss(outcomes, cif, t, e, s, weight, day, split_time,
         # A horizon landing inside the landmark's own bin is not a prediction.
         resolvable = (b_h > s).to(p.dtype)
 
-        w_ipcw = torch.where(
+        # Censoring weights must be CONDITIONED ON THE LANDMARK: every row here
+        # is a patient known to be uncensored at day_s, so the relevant
+        # probability is G(.)/G(s), not G(.).  The unconditional form inflates
+        # late landmarks -- on one split it nearly doubled the weight of the
+        # >365 d band -- which points the opposite way to the tau=180 decay that
+        # deliberately down-weights those same rows.  Left unconditional it undid
+        # the decay and worsened the calibration slope while flattering AUC.
+        w_ipcw = (g_bins[s] * torch.where(
             t <= b_h,
             1.0 / g_bins[(t - 1).clamp(min = 0)],
             1.0 / g_bins[b_h],
-        ).clamp(max = float(ipcw_clip))
+        )).clamp(max = float(ipcw_clip))
 
         w = weight.to(p.dtype) * w_ipcw * known * resolvable * alive_at_s
         total = total - (w * (y * torch.log(p) + (1 - y) * torch.log(1 - p))).sum()

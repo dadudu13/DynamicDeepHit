@@ -176,3 +176,36 @@ def test_gradient_flows_and_is_finite():
     loss.backward()
     assert m.p.grad is not None and torch.isfinite(m.p.grad).all()
     assert m.p.grad.abs().sum() > 0
+
+
+def test_ipcw_is_conditioned_on_the_landmark():
+    """Every scored row is a patient known to be uncensored at its landmark, so
+    the censoring weight is G(.)/G(s).  The unconditional 1/G inflates late
+    landmarks (on one split it nearly doubled the >365 d band's weight) and
+    cancels the decay weighting."""
+    n_bins = 20
+    split_time = torch.linspace(0, 2000, n_bins + 1).double()
+    # Two identical patients alive past their horizon; one scored at bin 0, one
+    # at bin 10.  Conditioning must make their weights nearly equal, not 1/G.
+    x = torch.ones(2, 1, 2, dtype=torch.double)
+    t = torch.tensor([19, 19]).long()
+    e = torch.tensor([0, 0]).int()
+    s = torch.tensor([0, 10]).long()
+    day = torch.tensor([0.0, 1000.0]).double()
+    # a censoring curve that decays through follow-up
+    g = torch.cumprod(torch.full((n_bins,), 0.93, dtype=torch.double), 0)
+    mass = torch.full((2, n_bins), 0.01, dtype=torch.double)
+    m = Toy(mass, n_bins)
+    _, outcomes = m(x)
+    cif = [torch.cumsum(o, 1) for o in outcomes]
+
+    def contrib(s_, day_):
+        return horizon_likelihood_loss(
+            outcomes, cif, t[:1], e[:1], s_, torch.ones(1, dtype=torch.double),
+            day=day_, split_time=split_time, horizons=[500.0], g_bins=g).item()
+
+    early = contrib(s[:1], day[:1])
+    late = contrib(s[1:], day[1:])
+    # p differs a little between the two (different conditioning point), so this
+    # is a loose bound -- the point is that the late row is not ~2x the early one.
+    assert 0.5 < late / early < 1.6, late / early

@@ -211,6 +211,7 @@ def train_ddh(model,
 		# Raw magnitudes of the two survival terms, so the gamma that makes them
 		# comparable can be read off a run instead of guessed.
 		epoch_parts = {} if (gamma != 0 and i < 3) else None
+		clip_stats = [0, 0, 0.0] if i < 3 else None
 		for j in range(0, n_train, bs):
 			xb = x_ep[j : j + bs]
 			tb = t_ep[j : j + bs]
@@ -246,7 +247,18 @@ def train_ddh(model,
 				loss = total_loss(model, xb, tb, eb, alpha, beta, sigma, s=sb, cause_weights=cause_weights)
 				loss.backward()
 			if grad_clip_norm > 0:
-				nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+				# The binary log likelihood's gradient is -w/p for an event row, so at
+				# a low event rate p a single event contributes about 1/p times what a
+				# non-event does; if that makes clipping bite far more often with gamma > 0,
+				# the clip is rescaling the whole update in the events' favour and
+				# the arm's over-prediction is an artefact of the clip, not of the
+				# term.  Cheap to record, and it decides that question from the runs
+				# already being done rather than from a separate experiment.
+				gn = nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+				if clip_stats is not None:
+					clip_stats[0] += 1
+					clip_stats[1] += int(float(gn) > grad_clip_norm)
+					clip_stats[2] += float(gn)
 			optimizer.step()
 
 		# Validation — skip gradient tracking to save memory and compute.
@@ -284,6 +296,10 @@ def train_ddh(model,
 					model, xb, tb, eb, alpha, beta, sigma,
 					s=sb, cause_weights=cause_weights
 				).item()
+		if clip_stats and clip_stats[0]:
+			print(f"[grad] epoch {i}: clipped on {clip_stats[1]}/{clip_stats[0]} batches "
+				  f"({100 * clip_stats[1] / clip_stats[0]:.0f}%), mean pre-clip norm "
+				  f"{clip_stats[2] / clip_stats[0]:.2f} (limit {grad_clip_norm})", flush = True)
 		if epoch_parts:
 			print(f"[horizon] epoch {i}: sum raw NLL {epoch_parts['nll']:.1f}  "
 				  f"sum raw horizon {epoch_parts['horizon']:.1f}  "
