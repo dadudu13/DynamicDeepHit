@@ -78,7 +78,9 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 		  visit_days = None, landmark_augment_prob = 0.0, landmark_decay_days = None,
 		  entry_weight = None,
 		  visit_days_val = None, all_landmark_nll = False,
-		  landmark_chunk_rows = 512):
+		  landmark_chunk_rows = 512,
+		  gamma = 0.0, horizon_days = None, horizon_ipcw_clip = 10.0,
+		  event_of_interest = 0):
 		random.seed(random_state)
 		np.random.seed(random_state)
 		torch.manual_seed(random_state)
@@ -148,7 +150,11 @@ class DynamicDeepHit(DeepRecurrentSurvivalMachines):
 					visit_days_valid = visit_days_val_tensor,
 					landmark_decay_days = landmark_decay_days,
 					entry_weight_train = entry_w_train_tensor,
-					entry_weight_valid = entry_w_val_tensor)
+					entry_weight_valid = entry_w_val_tensor,
+					gamma = gamma,
+					horizon_days = horizon_days,
+					horizon_ipcw_clip = horizon_ipcw_clip,
+					event_of_interest = event_of_interest)
 
 		self.torch_model = model.eval()
 		self.fitted = True

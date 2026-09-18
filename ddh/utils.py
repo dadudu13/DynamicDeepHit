@@ -1,4 +1,5 @@
-from ddh.losses import total_loss, build_landmark_prefixes, landmark_nll_loss
+from ddh.losses import (total_loss, build_landmark_prefixes, landmark_nll_loss,
+						censoring_survival_by_bin, landmark_row_days)
 from ddh.dsm_compat import get_optimizer, _reshape_tensor_with_nans
 
 import torch
@@ -42,13 +43,24 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 						   alpha, beta, sigma, cause_weights,
 						   chunk_rows = 512, backward = False,
 						   visit_days_b = None, landmark_decay_days = None,
-						   entry_weight_b = None):
+						   entry_weight_b = None,
+						   gamma = 0.0, horizon_spec = None,
+						   component_totals = None):
 	"""
 		Total loss with the survival term evaluated at EVERY landmark instead of
 		only the final visit:
 
 			L = (1-alpha-beta) * L_long + alpha * L_rank
 				+ beta * (1/K) sum_i (1/V_i) sum_v -log P(T_i,K_i | T_i>s_iv, X_i,<=v)
+
+		With gamma > 0 a horizon-specific binary likelihood is added on the same
+		expanded rows (see ddh.losses.horizon_likelihood_loss):
+
+			+ gamma * (1/K) (1/H) sum_h sum_i (1/V_i) sum_v
+					w_ipcw * -log P_hat(status at day_s+h | T>day_s, X_i,<=v)
+
+		It is ADDED, not carved out of alpha/beta, so gamma=0 is bit-identical to
+		the objective every existing arm was trained under.
 
 		Longitudinal and ranking losses stay on the full-history rows, so their
 		tuned weights keep the same scale as the final-visit objective and only
@@ -72,15 +84,33 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 		entry_weight = entry_weight_b)
 	t_exp, e_exp = tb.long()[patient_idx], eb.int()[patient_idx]
 
+	# The horizon term needs each row's landmark DAY (to locate the bin holding
+	# day_s + h); the NLL only ever needed its landmark BIN.
+	day_exp = None
+	use_horizon = gamma != 0 and horizon_spec is not None and visit_days_b is not None
+	if use_horizon:
+		day_exp = landmark_row_days(x_exp, patient_idx, visit_days_b)
+
 	n_rows = x_exp.shape[0]
 	step = n_rows if not chunk_rows or chunk_rows <= 0 else chunk_rows
 	for start in range(0, n_rows, step):
 		sl = slice(start, start + step)
-		nll = beta * landmark_nll_loss(model, x_exp[sl], t_exp[sl], e_exp[sl],
-									   s_exp[sl], weight[sl])
+		spec = None
+		if use_horizon:
+			spec = dict(horizon_spec)
+			spec["day"] = day_exp[sl]
+		parts = {} if component_totals is not None else None
+		nll = landmark_nll_loss(model, x_exp[sl], t_exp[sl], e_exp[sl],
+								s_exp[sl], weight[sl], nll_weight = beta,
+								horizon_spec = spec, gamma = gamma,
+								components = parts)
 		if backward:
 			nll.backward()
 		total += nll.item()
+		if parts is not None:
+			# Raw, unweighted magnitudes -- what gamma has to be set against.
+			component_totals["nll"] = component_totals.get("nll", 0.0) + parts["nll"]
+			component_totals["horizon"] = component_totals.get("horizon", 0.0) + parts["horizon"]
 
 	return total
 
@@ -104,7 +134,11 @@ def train_ddh(model,
 			  visit_days_valid = None,
 			  landmark_decay_days = None,
 			  entry_weight_train = None,
-			  entry_weight_valid = None):
+			  entry_weight_valid = None,
+			  gamma = 0.0,
+			  horizon_days = None,
+			  horizon_ipcw_clip = 10.0,
+			  event_of_interest = 0):
 
 	optimizer = get_optimizer(model, lr)
 	# Halve LR when val loss plateaus; fires at half the early-stop patience so
@@ -130,6 +164,32 @@ def train_ddh(model,
 		if augment:
 			raise ValueError("all_landmark_nll=True is incompatible with landmark_augment_prob > 0")
 
+	# ---- horizon-specific likelihood term -------------------------------------
+	# The censoring distribution is estimated ONCE, from this fold's training rows
+	# only, and held fixed: re-fitting it per batch would make the weights noisy
+	# and would let batch composition move the objective.
+	horizon_spec = None
+	if gamma != 0:
+		if not all_landmark_nll:
+			raise ValueError("gamma > 0 requires all_landmark_nll=True")
+		if split_time is None:
+			raise ValueError("gamma > 0 requires split_time")
+		if not horizon_days:
+			raise ValueError("gamma > 0 requires horizon_days")
+		n_bins = len(split_time) - 1
+		g_bins = censoring_survival_by_bin(t_train, e_train, n_bins)
+		horizon_spec = {
+			"split_time": torch.as_tensor(split_time).double(),
+			"horizons": [float(h) for h in horizon_days],
+			"g_bins": g_bins,
+			"ipcw_clip": float(horizon_ipcw_clip),
+			"event_of_interest": int(event_of_interest),
+		}
+		print(f"[horizon] gamma={gamma} horizons={list(horizon_days)} "
+			  f"bins={n_bins} G(last)={float(g_bins[-1]):.3f} "
+			  f"max 1/G={float((1.0 / g_bins).clamp(max=horizon_ipcw_clip).max()):.2f}",
+			  flush = True)
+
 	for i in tqdm(range(n_iter)):
 		# Re-shuffle every epoch so batch composition varies across epochs.
 		perm = torch.randperm(n_train)
@@ -148,6 +208,9 @@ def train_ddh(model,
 			x_ep, s_ep = _augment_landmark_truncation(x_ep, s_ep, visit_days_ep, split_time_tensor, landmark_augment_prob)
 
 		model.train()
+		# Raw magnitudes of the two survival terms, so the gamma that makes them
+		# comparable can be read off a run instead of guessed.
+		epoch_parts = {} if (gamma != 0 and i < 3) else None
 		for j in range(0, n_train, bs):
 			xb = x_ep[j : j + bs]
 			tb = t_ep[j : j + bs]
@@ -176,7 +239,9 @@ def train_ddh(model,
 									   chunk_rows = landmark_chunk_rows, backward = True,
 									   visit_days_b = visit_days_b,
 									   landmark_decay_days = landmark_decay_days,
-									   entry_weight_b = entry_w_b)
+									   entry_weight_b = entry_w_b,
+									   gamma = gamma, horizon_spec = horizon_spec,
+									   component_totals = epoch_parts)
 			else:
 				loss = total_loss(model, xb, tb, eb, alpha, beta, sigma, s=sb, cause_weights=cause_weights)
 				loss.backward()
@@ -212,12 +277,18 @@ def train_ddh(model,
 					visit_days_b = visit_days_b,
 					landmark_decay_days = landmark_decay_days,
 					entry_weight_b = entry_w_b,
+					gamma = gamma, horizon_spec = horizon_spec,
 				)
 			else:
 				valid_loss = total_loss(
 					model, xb, tb, eb, alpha, beta, sigma,
 					s=sb, cause_weights=cause_weights
 				).item()
+		if epoch_parts:
+			print(f"[horizon] epoch {i}: sum raw NLL {epoch_parts['nll']:.1f}  "
+				  f"sum raw horizon {epoch_parts['horizon']:.1f}  "
+				  f"contribution beta*NLL {beta * epoch_parts['nll']:.1f} vs "
+				  f"gamma*horizon {gamma * epoch_parts['horizon']:.1f}", flush = True)
 		scheduler.step(valid_loss)
 
 		if valid_loss < old_loss:

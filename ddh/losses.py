@@ -139,7 +139,9 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
 
     return x_exp, s_exp, patient_idx, weight
 
-def landmark_nll_loss(model, x_exp, t_exp, e_exp, s_exp, weight):
+def landmark_nll_loss(model, x_exp, t_exp, e_exp, s_exp, weight,
+                      nll_weight=1.0, horizon_spec=None, gamma=0.0,
+                      components=None):
     """
         Conditional survival NLL evaluated at every landmark, averaged within a
         patient before being summed across patients:
@@ -152,13 +154,44 @@ def landmark_nll_loss(model, x_exp, t_exp, e_exp, s_exp, weight):
         the patient's event bin carry no information about the remaining horizon
         and are dropped; the 1 / V_i weight is deliberately left as-is, so those
         few patients (0.5% of rows on the VTE cohort) count slightly under 1.
+
+        With `horizon_spec` and gamma > 0 the same forward pass also supplies
+        horizon_likelihood_loss, and the returned scalar is
+        nll_weight * nll + gamma * horizon.
+        Sharing the forward is what keeps the extra term nearly free: it reuses
+        `outcomes` and `cif`, adding only two gathers per horizon.  Pass a dict as
+        `components` to read the two pieces back for logging.
     """
     _, outcomes = model(x_exp)
     cif = [torch.cumsum(ok, 1) for ok in outcomes]
     log_lik = log_likelihood_per_sample(outcomes, cif, t_exp, e_exp, s = s_exp)
 
     usable = (s_exp < t_exp).double()
-    return - (log_lik * weight * usable).sum() / len(outcomes)
+    nll = - (log_lik * weight * usable).sum() / len(outcomes)
+
+    # gamma=0 or no spec returns exactly the previous scalar at the default
+    # nll_weight=1, so every arm trained before this term existed is an exact
+    # control.  nll_weight carries beta INSIDE, so that the caller does not
+    # multiply the horizon term by beta as well.
+    if horizon_spec is None or gamma == 0:
+        if components is not None:
+            components["nll"] = float(nll.item())
+            components["horizon"] = 0.0
+        return nll_weight * nll
+
+    hz = horizon_likelihood_loss(
+        outcomes, cif, t_exp, e_exp, s_exp, weight,
+        day = horizon_spec["day"],
+        split_time = horizon_spec["split_time"],
+        horizons = horizon_spec["horizons"],
+        g_bins = horizon_spec["g_bins"],
+        ipcw_clip = horizon_spec.get("ipcw_clip", 10.0),
+        event_of_interest = horizon_spec.get("event_of_interest", 0),
+    )
+    if components is not None:
+        components["nll"] = float(nll.item())
+        components["horizon"] = float(hz.item())
+    return nll_weight * nll + gamma * hz
 
 def ranking_loss(cif, t, e, sigma, s=None, cause_weights=None):
     """
@@ -293,3 +326,131 @@ def total_loss(model, x, t, e, alpha, beta, sigma, s=None, cause_weights=None, i
     if include_nll:
         loss = loss + beta * negative_log_likelihood(outcomes, cif, t, e, s=s)
     return loss
+
+
+# ---------------------------------------------------------------------------
+# Horizon-specific likelihood
+#
+# WHY THIS TERM EXISTS.  The all-landmark NLL is a multinomial likelihood over
+# (cause, bin): it scores the probability mass the model puts on the ONE bin an
+# event actually landed in, spread over ~100 bins.  Nothing in it constrains the
+# CUMULATIVE probability at the horizons the model is deployed at.  The
+# parameterisation probe showed the consequence directly: at landmark 0 the
+# model over-predicted the 90-day level by as much on the data it was fitted
+# on as out of sample.  That is not a generalisation failure, it is the
+# objective not being asked about the level.
+#
+# This term asks.  For every (patient, visit) landmark row and every deployment
+# horizon h it forms the exact quantity the model is scored on,
+#
+#     p = F_1(day_s + h | T > day_s, X_<=v) = (F_1(b_h) - F_1(s)) / S(s)
+#
+# and adds the IPCW-weighted binary log likelihood of the observed status at h.
+# Binary log likelihood is a strictly proper scoring rule, so its minimiser is
+# the true conditional probability at h -- the level, not just the ordering.
+#
+# LABELS AND WEIGHTS mirror V3's evaluation code exactly (Graf/Gerds-Schumacher):
+#     T <= h, cause 1   -> y = 1, weight 1 / G(T-)
+#     T <= h, cause 2   -> y = 0, weight 1 / G(T-)   (death without VTE is a true 0)
+#     T >  h            -> y = 0, weight 1 / G(h)
+#     censored before h -> weight 0                  (status unknown)
+# Matching the metric matters more than picking a different defensible estimator:
+# a training term and a reported metric that disagree cannot be read together.
+#
+# NOT CARVED OUT OF THE EXISTING WEIGHTS.  The term is added with its own gamma
+# on top of (1-alpha-beta)/alpha/beta rather than taking a share of them, so
+# gamma=0 reproduces the previous objective bit for bit and every existing arm
+# stays a valid control.
+
+CENSOR_FLOOR = 1e-2
+HORIZON_EPS = 1e-5
+
+
+def censoring_survival_by_bin(t, e, n_bins):
+    """
+        Kaplan-Meier estimate of the censoring distribution G on the bin grid.
+
+        Fitted once per training fold from that fold's own (t, e), so no
+        held-out information reaches the weights.  Returned as a length-n_bins
+        vector so a weight lookup inside the training loop is an index, not a fit.
+    """
+    t = t.detach().long().reshape(-1).cpu().clamp(0, int(n_bins) - 1)
+    e = e.detach().int().reshape(-1).cpu()
+    n_bins = int(n_bins)
+    counts = torch.bincount(t, minlength = n_bins).double()
+    at_risk = counts.flip(0).cumsum(0).flip(0)                 # #{T >= b}
+    cens = torch.bincount(t[e == 0], minlength = n_bins).double()
+    frac = (1.0 - cens / at_risk.clamp(min = 1.0)).clamp(min = 0.0)
+    return torch.cumprod(frac, 0).clamp(min = CENSOR_FLOOR)
+
+
+def landmark_row_days(x_exp, patient_idx, visit_days):
+    """
+        Landmark day of every expanded prefix row.
+
+        build_landmark_prefixes NaNs out everything after visit v, so the number
+        of observed timesteps left in a row IS v+1; that recovers the visit index
+        without changing the helper's signature or its tested return shape.
+    """
+    visit_idx = (~torch.isnan(x_exp[:, :, 0])).sum(dim = 1).long() - 1
+    visit_idx = visit_idx.clamp(min = 0, max = visit_days.shape[1] - 1)
+    days = visit_days[patient_idx, visit_idx]
+    return torch.nan_to_num(days, nan = 0.0).clamp(min = 0.0)
+
+
+def horizon_likelihood_loss(outcomes, cif, t, e, s, weight, day, split_time,
+                            horizons, g_bins, ipcw_clip = 10.0,
+                            event_of_interest = 0):
+    """
+        IPCW-weighted binary log likelihood of the landmark-conditioned CIF at
+        each deployment horizon, summed over rows exactly the way
+        negative_log_likelihood sums over patients (so gamma is on the same
+        scale as beta) and averaged over horizons (so gamma does not change
+        meaning when a horizon is added or removed).
+
+        Args:
+            day        : [R] landmark day of each expanded row.
+            split_time : [n_bins+1] bin edges, as a tensor.
+            g_bins     : [n_bins] censoring survival, from censoring_survival_by_bin.
+            ipcw_clip  : cap on 1/G.  Late landmarks push b_h deep into follow-up
+                         where G is small; uncapped, a handful of rows would carry
+                         most of the gradient.
+    """
+    n_bins = cif[0].shape[1]
+    device = cif[0].device
+    rows = torch.arange(len(t), device = device)
+    g_bins = g_bins.to(device)
+
+    F_s = torch.stack([c[rows, s] for c in cif])
+    S_s = (1.0 - F_s.sum(0)).clamp(min = SURVIVAL_FLOOR)
+    F_eoi_s = F_s[event_of_interest]
+
+    # Rows whose landmark is at or past the event bin carry no information about
+    # the remaining horizon -- the same rule landmark_nll_loss applies.
+    alive_at_s = (s < t).to(F_s.dtype)
+
+    total = torch.zeros((), dtype = cif[0].dtype, device = device)
+    for h in horizons:
+        # Matches ddh_api._visit_day_bins: np.digitize(right=True) - 1 is
+        # torch.bucketize(right=False) - 1, NOT bucketize(right=True).
+        b_h = (torch.bucketize(day + float(h), split_time, right = False) - 1)
+        b_h = b_h.clamp(0, n_bins - 1)
+
+        p = ((cif[event_of_interest][rows, b_h] - F_eoi_s) / S_s).clamp(
+            HORIZON_EPS, 1.0 - HORIZON_EPS)
+
+        y = ((t <= b_h) & (e == event_of_interest + 1)).to(p.dtype)
+        known = ((t > b_h) | (e != 0)).to(p.dtype)
+        # A horizon landing inside the landmark's own bin is not a prediction.
+        resolvable = (b_h > s).to(p.dtype)
+
+        w_ipcw = torch.where(
+            t <= b_h,
+            1.0 / g_bins[(t - 1).clamp(min = 0)],
+            1.0 / g_bins[b_h],
+        ).clamp(max = float(ipcw_clip))
+
+        w = weight.to(p.dtype) * w_ipcw * known * resolvable * alive_at_s
+        total = total - (w * (y * torch.log(p) + (1 - y) * torch.log(1 - p))).sum()
+
+    return total / len(outcomes) / max(len(horizons), 1)
