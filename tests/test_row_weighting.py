@@ -45,3 +45,22 @@ def test_unknown_weighting_is_rejected():
     x, _, _, s_all = _make_batch([2, 2])
     with pytest.raises(ValueError, match="row_weighting"):
         build_landmark_prefixes(x, s_all, row_weighting="per_row")
+
+
+def test_given_weighting_uses_the_supplied_weights():
+    lengths = [2, 3]
+    x, _, _, s_all = _make_batch(lengths)
+    rw = torch.full((x.shape[0], x.shape[1]), float("nan")).double()
+    rw[0, :2] = torch.tensor([1.0, 3.0]).double()
+    rw[1, :3] = torch.tensor([2.0, 2.0, 2.0]).double()
+    _, _, _, w = build_landmark_prefixes(x, s_all, row_weighting="given", row_weights=rw)
+    # Supplied ratios are kept; only the overall scale is set by the batch total.
+    assert w.sum().item() == pytest.approx(len(lengths))
+    assert (w[1] / w[0]).item() == pytest.approx(3.0)
+    assert (w[2] / w[0]).item() == pytest.approx(2.0)
+
+
+def test_given_weighting_needs_weights():
+    x, _, _, s_all = _make_batch([2, 2])
+    with pytest.raises(ValueError, match="requires row_weights"):
+        build_landmark_prefixes(x, s_all, row_weighting="given")

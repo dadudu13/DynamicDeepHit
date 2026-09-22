@@ -65,7 +65,8 @@ def negative_log_likelihood(outcomes, cif, t, e, s=None):
     return - log_likelihood_per_sample(outcomes, cif, t, e, s = s).sum() / len(outcomes)
 
 def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
-                            entry_weight=None, row_weighting="patient"):
+                            entry_weight=None, row_weighting="patient",
+                            row_weights=None):
     """
         Expand one row per patient into one row per (patient, visit) landmark.
 
@@ -92,6 +93,10 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
         row_weighting:
             "patient" (default) -- 1 / V_i, the weighting every arm before this
                         option was trained under.
+            "given"   -- each row carries the weight supplied in `row_weights`
+                        ([N, T], aligned with x), scaled to the same batch total.
+                        Used for inverse-intensity weights, which are estimated
+                        from the visit process outside the model.
             "visit"   -- every row equal.  The per-patient scheme is informative
                         when visit count tracks the outcome (a patient with an
                         early event has few visits, so each of their rows counts
@@ -123,17 +128,26 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
 
     s_exp = s_all[patient_idx, visit_idx]
 
-    if row_weighting not in ("patient", "visit"):
-        raise ValueError(f"row_weighting must be 'patient' or 'visit', got {row_weighting!r}")
-    if row_weighting == "visit" and decay_days is not None:
+    if row_weighting not in ("patient", "visit", "given"):
+        raise ValueError(
+            f"row_weighting must be 'patient', 'visit' or 'given', got {row_weighting!r}")
+    if row_weighting == "given" and row_weights is None:
+        raise ValueError("row_weighting='given' requires row_weights")
+    if row_weighting in ("visit", "given") and decay_days is not None:
         # The decay redistributes weight WITHIN a patient's unit of weight, which is
         # the thing "visit" removes; combining them has no defined meaning.
-        raise ValueError("row_weighting='visit' is incompatible with decay_days")
+        raise ValueError(
+            f"row_weighting={row_weighting!r} is incompatible with decay_days")
 
-    if row_weighting == "visit":
-        n_rows = len(patient_idx)
-        weight = torch.full((n_rows,), x.shape[0] / max(n_rows, 1),
-                            dtype=torch.float64, device=device)
+    if row_weighting in ("visit", "given"):
+        if row_weighting == "visit":
+            w = torch.ones(len(patient_idx), dtype=torch.float64, device=device)
+        else:
+            w = row_weights[:, :t_max].to(torch.float64)[patient_idx, visit_idx]
+            w = torch.nan_to_num(w, nan=1.0).clamp(min=1e-6)
+        # Same batch total as the per-patient scheme, so only the distribution of
+        # weight changes and not the loss scale.
+        weight = w * (x.shape[0] / w.sum().clamp(min=1e-12))
     elif decay_days is not None and visit_days is not None:
         # Exponential decay in landmark DAY, renormalised within patient.
         #
