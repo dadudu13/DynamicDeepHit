@@ -65,7 +65,7 @@ def negative_log_likelihood(outcomes, cif, t, e, s=None):
     return - log_likelihood_per_sample(outcomes, cif, t, e, s = s).sum() / len(outcomes)
 
 def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
-                            entry_weight=None):
+                            entry_weight=None, row_weighting="patient"):
     """
         Expand one row per patient into one row per (patient, visit) landmark.
 
@@ -84,7 +84,23 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
             s_exp       : [R] landmark bin of each row.
             patient_idx : [R] index into the original batch.
             weight      : [R] 1 / V_i, so every patient contributes weight 1 in
-                          total regardless of how many visits they have.
+                          total regardless of how many visits they have.  With
+                          row_weighting="visit" every landmark row instead carries
+                          the same weight, so a patient contributes in proportion
+                          to how many visits they have.
+
+        row_weighting:
+            "patient" (default) -- 1 / V_i, the weighting every arm before this
+                        option was trained under.
+            "visit"   -- every row equal.  The per-patient scheme is informative
+                        when visit count tracks the outcome (a patient with an
+                        early event has few visits, so each of their rows counts
+                        for more), which biases the bins those rows inform.  The
+                        equal-row weights are scaled to sum to the batch size,
+                        the same total the per-patient scheme has, so only the
+                        distribution of weight changes and not the loss scale --
+                        which matters here, because the gradient is clipped to a
+                        fixed norm.
     """
     lengths = (~torch.isnan(x[:, :, 0])).sum(dim = 1)
     t_max = int(lengths.max().item())
@@ -107,7 +123,18 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
 
     s_exp = s_all[patient_idx, visit_idx]
 
-    if decay_days is not None and visit_days is not None:
+    if row_weighting not in ("patient", "visit"):
+        raise ValueError(f"row_weighting must be 'patient' or 'visit', got {row_weighting!r}")
+    if row_weighting == "visit" and decay_days is not None:
+        # The decay redistributes weight WITHIN a patient's unit of weight, which is
+        # the thing "visit" removes; combining them has no defined meaning.
+        raise ValueError("row_weighting='visit' is incompatible with decay_days")
+
+    if row_weighting == "visit":
+        n_rows = len(patient_idx)
+        weight = torch.full((n_rows,), x.shape[0] / max(n_rows, 1),
+                            dtype=torch.float64, device=device)
+    elif decay_days is not None and visit_days is not None:
         # Exponential decay in landmark DAY, renormalised within patient.
         #
         # Day, not visit index: a weekly-seen patient reaches visit 5 at day 35

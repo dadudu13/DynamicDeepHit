@@ -43,7 +43,7 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 						   alpha, beta, sigma, cause_weights,
 						   chunk_rows = 512, backward = False,
 						   visit_days_b = None, landmark_decay_days = None,
-						   entry_weight_b = None,
+						   entry_weight_b = None, landmark_row_weighting = "patient",
 						   gamma = 0.0, horizon_spec = None,
 						   component_totals = None):
 	"""
@@ -81,7 +81,7 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 
 	x_exp, s_exp, patient_idx, weight = build_landmark_prefixes(
 		xb, s_all_b, visit_days = visit_days_b, decay_days = landmark_decay_days,
-		entry_weight = entry_weight_b)
+		entry_weight = entry_weight_b, row_weighting = landmark_row_weighting)
 	t_exp, e_exp = tb.long()[patient_idx], eb.int()[patient_idx]
 
 	# The horizon term needs each row's landmark DAY (to locate the bin holding
@@ -133,6 +133,7 @@ def train_ddh(model,
 			  landmark_chunk_rows = 512,
 			  visit_days_valid = None,
 			  landmark_decay_days = None,
+			  landmark_row_weighting = "patient",
 			  entry_weight_train = None,
 			  entry_weight_valid = None,
 			  gamma = 0.0,
@@ -240,6 +241,7 @@ def train_ddh(model,
 									   chunk_rows = landmark_chunk_rows, backward = True,
 									   visit_days_b = visit_days_b,
 									   landmark_decay_days = landmark_decay_days,
+									   landmark_row_weighting = landmark_row_weighting,
 									   entry_weight_b = entry_w_b,
 									   gamma = gamma, horizon_spec = horizon_spec,
 									   component_totals = epoch_parts)
@@ -288,6 +290,7 @@ def train_ddh(model,
 					chunk_rows = landmark_chunk_rows, backward = False,
 					visit_days_b = visit_days_b,
 					landmark_decay_days = landmark_decay_days,
+					landmark_row_weighting = landmark_row_weighting,
 					entry_weight_b = entry_w_b,
 					gamma = gamma, horizon_spec = horizon_spec,
 				)
