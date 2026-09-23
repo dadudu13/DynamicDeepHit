@@ -64,3 +64,53 @@ def test_given_weighting_needs_weights():
     x, _, _, s_all = _make_batch([2, 2])
     with pytest.raises(ValueError, match="requires row_weights"):
         build_landmark_prefixes(x, s_all, row_weighting="given")
+
+
+def _days(lengths, per_patient_days):
+    d = torch.zeros(len(lengths), max(lengths)).double()
+    for i, days in enumerate(per_patient_days):
+        d[i, :len(days)] = torch.tensor(days).double()
+    return d
+
+
+def test_band_weighting_collapses_to_one_over_v_with_a_single_band():
+    """One band covering the whole axis is the per-patient scheme, up to the batch scale."""
+    lengths = [1, 3, 4]
+    x, _, _, s_all = _make_batch(lengths)
+    days = _days(lengths, [[0], [0, 10, 20], [0, 5, 400, 900]])
+    # A single edge below day 0 puts every row in one band.
+    _, _, _, w_band = build_landmark_prefixes(x, s_all, visit_days=days,
+                                              row_weighting="band", band_edges=[-1.0])
+    *_, w_patient = build_landmark_prefixes(x, s_all, row_weighting="patient")
+    scale = w_patient.sum() / w_band.sum()
+    assert torch.allclose(w_band * scale, w_patient)
+
+
+def test_band_weighting_collapses_to_per_visit_when_each_band_holds_one_visit():
+    lengths = [1, 3]
+    x, _, _, s_all = _make_batch(lengths)
+    days = _days(lengths, [[0], [0, 100, 300]])
+    edges = [0.0, 50.0, 200.0, 500.0]
+    _, _, _, w_band = build_landmark_prefixes(x, s_all, visit_days=days,
+                                              row_weighting="band", band_edges=edges)
+    _, _, _, w_visit = build_landmark_prefixes(x, s_all, row_weighting="visit")
+    assert torch.allclose(w_band, w_visit)
+
+
+def test_band_weighting_counts_each_patient_once_per_band():
+    """The baseline visit has its own band; the three inside 1-365 d count a third each."""
+    lengths = [5]
+    x, _, _, s_all = _make_batch(lengths)
+    days = _days(lengths, [[0, 7, 14, 21, 400]])
+    edges = [0.0, 1.0, 366.0]          # bands: day 0 | 1-365 | 366+
+    _, _, _, w = build_landmark_prefixes(x, s_all, visit_days=days,
+                                         row_weighting="band", band_edges=edges)
+    ratios = (w / w.min()).numpy()
+    assert np.allclose(ratios, [3, 1, 1, 1, 3])   # day 0 alone | 7, 14, 21 | 400
+    assert w.sum().item() == pytest.approx(1.0)   # one patient -> batch total 1
+
+
+def test_band_weighting_needs_edges_and_days():
+    x, _, _, s_all = _make_batch([2, 2])
+    with pytest.raises(ValueError, match="band_edges"):
+        build_landmark_prefixes(x, s_all, row_weighting="band")

@@ -66,7 +66,7 @@ def negative_log_likelihood(outcomes, cif, t, e, s=None):
 
 def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
                             entry_weight=None, row_weighting="patient",
-                            row_weights=None):
+                            row_weights=None, band_edges=None):
     """
         Expand one row per patient into one row per (patient, visit) landmark.
 
@@ -93,6 +93,14 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
         row_weighting:
             "patient" (default) -- 1 / V_i, the weighting every arm before this
                         option was trained under.
+            "band"    -- every patient counts ONCE inside each landmark-day band
+                        given by `band_edges`: a row's weight is 1 / (that
+                        patient's rows in that band).  This is the weighting the
+                        model is evaluated under, where each patient still at risk
+                        is scored once at each landmark.  The other two schemes
+                        are its limits: one band covering the whole axis gives
+                        1 / V_i exactly, and bands narrow enough to hold one visit
+                        each give equal weight per row.  Needs `visit_days`.
             "given"   -- each row carries the weight supplied in `row_weights`
                         ([N, T], aligned with x), scaled to the same batch total.
                         Used for inverse-intensity weights, which are estimated
@@ -128,20 +136,35 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
 
     s_exp = s_all[patient_idx, visit_idx]
 
-    if row_weighting not in ("patient", "visit", "given"):
+    if row_weighting not in ("patient", "visit", "given", "band"):
         raise ValueError(
-            f"row_weighting must be 'patient', 'visit' or 'given', got {row_weighting!r}")
+            "row_weighting must be 'patient', 'visit', 'given' or 'band', "
+            f"got {row_weighting!r}")
+    if row_weighting == "band" and (band_edges is None or visit_days is None):
+        raise ValueError("row_weighting='band' requires band_edges and visit_days")
     if row_weighting == "given" and row_weights is None:
         raise ValueError("row_weighting='given' requires row_weights")
-    if row_weighting in ("visit", "given") and decay_days is not None:
+    if row_weighting in ("visit", "given", "band") and decay_days is not None:
         # The decay redistributes weight WITHIN a patient's unit of weight, which is
         # the thing "visit" removes; combining them has no defined meaning.
         raise ValueError(
             f"row_weighting={row_weighting!r} is incompatible with decay_days")
 
-    if row_weighting in ("visit", "given"):
+    if row_weighting in ("visit", "given", "band"):
         if row_weighting == "visit":
             w = torch.ones(len(patient_idx), dtype=torch.float64, device=device)
+        elif row_weighting == "band":
+            # 1 / (rows this patient has in this band), so each patient carries one
+            # unit of weight per band they are observed in.  Every row of a patient
+            # is in this batch (they are expanded from it), so the counts are exact.
+            days = torch.nan_to_num(
+                visit_days[:, :t_max].to(torch.float64)[patient_idx, visit_idx], nan = 0.0
+            ).clamp(min = 0.0)
+            edges = torch.as_tensor(band_edges, dtype = torch.float64, device = device)
+            band = torch.bucketize(days, edges, right = False)
+            key = patient_idx * (len(edges) + 1) + band
+            counts = torch.bincount(key, minlength = x.shape[0] * (len(edges) + 1))
+            w = 1.0 / counts[key].to(torch.float64)
         else:
             w = row_weights[:, :t_max].to(torch.float64)[patient_idx, visit_idx]
             w = torch.nan_to_num(w, nan=1.0).clamp(min=1e-6)
