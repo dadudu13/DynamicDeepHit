@@ -1,5 +1,5 @@
 """The horizon-specific likelihood term must be (a) inert at gamma=0, (b) scored on
-exactly the labels and weights V3's evaluation uses, and (c) minimised at the truth."""
+exactly the labels and weights the landmark evaluation uses, and (c) minimised at the truth."""
 import sys
 from pathlib import Path
 
@@ -104,8 +104,8 @@ def test_horizon_inside_the_landmark_bin_contributes_nothing():
     assert parts["horizon"] == 0.0
 
 
-def test_labels_and_weights_match_v3_evaluation():
-    """Graf/Gerds-Schumacher, as V3's parts(): cause-2 deaths before h are true
+def test_labels_and_weights_match_landmark_evaluation():
+    """Graf/Gerds-Schumacher, as the landmark evaluation: cause-2 deaths before h are true
     zeros carrying 1/G(T-), survivors past h carry 1/G(h), censored-before-h
     carry nothing."""
     n_bins = 10
@@ -114,7 +114,7 @@ def test_labels_and_weights_match_v3_evaluation():
     s_all = torch.zeros(4, 1).long()
     visit_days = torch.zeros(4, 1, dtype=torch.double)
     t = torch.tensor([3, 3, 9, 3]).long()          # bins
-    e = torch.tensor([1, 2, 0, 0]).int()           # VTE, death, censored late, censored early
+    e = torch.tensor([1, 2, 0, 0]).int()           # cause 1, cause 2, censored late, censored early
     split_time = torch.linspace(0, 1000, n_bins + 1).double()   # bin width 100
     # horizon 500 days -> bucketize(500) - 1 = bin 4
     mass = torch.full((2, n_bins), 0.02, dtype=torch.double)
@@ -130,8 +130,8 @@ def test_labels_and_weights_match_v3_evaluation():
     b_h = int(torch.bucketize(torch.tensor([500.0]), split_time, right=False).item()) - 1
     p = float((cif[0][0, b_h] - cif[0][0, 0]) / (1 - cif[0][0, 0] - cif[1][0, 0]))
     want = 0.0
-    want += -np.log(p) * float(1 / g[2])            # VTE at bin 3 <= 4, y=1, 1/G(T-)
-    want += -np.log(1 - p) * float(1 / g[2])        # death at bin 3, y=0, 1/G(T-)
+    want += -np.log(p) * float(1 / g[2])            # cause 1 at bin 3 <= 4, y=1, 1/G(T-)
+    want += -np.log(1 - p) * float(1 / g[2])        # cause 2 at bin 3, y=0, 1/G(T-)
     want += -np.log(1 - p) * float(1 / g[b_h])      # alive past h, y=0, 1/G(h)
     want += 0.0                                     # censored at bin 3 < h: dropped
     assert abs(val.item() - want / 2) < 1e-9, (val.item(), want / 2)

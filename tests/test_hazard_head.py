@@ -210,8 +210,8 @@ def test_proportional_keeps_risk_ordering_constant_across_bins():
     step = pmf.sum(-1)
     survival = 1.0 - step.cumsum(1)
     s_before = torch.cat([torch.ones(N, 1, dtype=torch.float64), survival[:, :-1]], 1)
-    lam_vte = (pmf[:, :, 0] / s_before)                       # [N, B]
-    order = lam_vte.argsort(dim=0)
+    lam_1 = (pmf[:, :, 0] / s_before)                         # [N, B]
+    order = lam_1.argsort(dim=0)
     for b in range(1, B):
         assert torch.equal(order[:, b], order[:, 0]), f"ranking changed at bin {b}"
 

@@ -73,8 +73,8 @@ def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
         A patient with V_i observed visits becomes V_i rows: row v keeps visits
         1..v+1 and NaNs out everything after, exactly the input the model would
         receive if that visit were the patient's last observation.  This is the
-        training-time counterpart of build_intermediate_landmark_dataset in the
-        DDH_implement pipeline, which does the same truncation at evaluation time.
+        training-time counterpart of landmark evaluation, which applies the same
+        truncation to every patient at test time.
 
         Args:
             x      : [N, T, D] padded features, NaN after each patient's last visit.
@@ -217,7 +217,7 @@ def landmark_nll_loss(model, x_exp, t_exp, e_exp, s_exp, weight,
         a single (final-visit) landmark.  Rows whose landmark bin is at or beyond
         the patient's event bin carry no information about the remaining horizon
         and are dropped; the 1 / V_i weight is deliberately left as-is, so those
-        few patients (0.5% of rows on the VTE cohort) count slightly under 1.
+        few patients count slightly under 1.
 
         With `horizon_spec` and gamma > 0 the same forward pass also supplies
         horizon_likelihood_loss, and the returned scalar is
@@ -272,7 +272,7 @@ def ranking_loss(cif, t, e, sigma, s=None, cause_weights=None):
         cause_weights: list of K non-negative floats (alpha_k in the DDH paper)
            scaling each cause's ranking contribution. Defaults to equal weights
            1/K. Increase a cause's weight to prioritise its ranking accuracy
-           (e.g. [0.8, 0.2] to penalise wrong VTE ordering more than death).
+           (e.g. [0.8, 0.2] to penalise wrong ordering of cause 1 more than cause 2).
 
         Uses torch.sum over valid pairs per the DDH paper (Σ_{i≠j}).
         Because the sum scales with batch size, set alpha in total_loss small
@@ -413,12 +413,12 @@ def total_loss(model, x, t, e, alpha, beta, sigma, s=None, cause_weights=None, i
 # Binary log likelihood is a strictly proper scoring rule, so its minimiser is
 # the true conditional probability at h -- the level, not just the ordering.
 #
-# LABELS AND WEIGHTS mirror V3's evaluation code exactly (Graf/Gerds-Schumacher):
+# LABELS AND WEIGHTS mirror the landmark evaluation exactly (Graf/Gerds-Schumacher):
 #     T <= h, cause 1   -> y = 1, weight G(s) / G(T-)
-#     T <= h, cause 2   -> y = 0, weight G(s) / G(T-)  (death without VTE is a true 0)
+#     T <= h, cause 2   -> y = 0, weight G(s) / G(T-)  (a competing event is a true 0)
 #     T >  h            -> y = 0, weight G(s) / G(h)
 #     censored before h -> weight 0                    (status unknown)
-# with the G(s) factor conditioning on the landmark, which V3 does not need
+# with the G(s) factor conditioning on the landmark, which the evaluation does not need
 # because it scores one landmark at a time and the factor divides out there.
 # Matching the metric matters more than picking a different defensible estimator:
 # a training term and a reported metric that disagree cannot be read together.
