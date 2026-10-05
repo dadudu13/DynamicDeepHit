@@ -22,6 +22,6 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           # auton-survival 0.1.0 (release commit); --no-deps because its metadata pins torch<2.0
           pip install --no-deps "auton-survival @ git+https://github.com/autonlab/auton-survival@5dde465f7223601717abddc1d075e837707c403b"
-          pip install -e ".[test]"
+          pip install -e ".[test,eval]"
       - name: Test
         run: python -m pytest -q
