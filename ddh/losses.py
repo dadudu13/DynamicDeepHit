@@ -64,7 +64,8 @@ def negative_log_likelihood(outcomes, cif, t, e, s=None):
     """
     return - log_likelihood_per_sample(outcomes, cif, t, e, s = s).sum() / len(outcomes)
 
-def build_landmark_prefixes(x, s_all):
+def build_landmark_prefixes(x, s_all, visit_days=None, decay_days=None,
+                            entry_weight=None):
     """
         Expand one row per patient into one row per (patient, visit) landmark.
 
@@ -105,7 +106,36 @@ def build_landmark_prefixes(x, s_all):
     x_exp[positions > visit_idx.unsqueeze(1)] = float('nan')
 
     s_exp = s_all[patient_idx, visit_idx]
-    weight = (1.0 / lengths.double())[patient_idx]
+
+    if decay_days is not None and visit_days is not None:
+        # Exponential decay in landmark DAY, renormalised within patient.
+        #
+        # Day, not visit index: a weekly-seen patient reaches visit 5 at day 35
+        # and a quarterly one at day 450, so indexing by visit confounds clinical
+        # timing with visit frequency.
+        #
+        # Renormalising per patient keeps the 1/V_i design's guarantee that every
+        # patient contributes total weight 1 -- this only redistributes attention
+        # *within* a patient, never between them.  As decay_days -> inf every
+        # exponent is 0 and the weights collapse back to a uniform 1/V_i.
+        days = torch.nan_to_num(
+            visit_days[:, :t_max].to(x_exp.dtype)[patient_idx, visit_idx], nan = 0.0
+        ).clamp(min = 0.0)
+        w = torch.exp(-days / float(decay_days))
+        totals = torch.zeros(x.shape[0], dtype = w.dtype, device = device)
+        totals = totals.index_add(0, patient_idx, w)
+        weight = w / totals[patient_idx].clamp(min = 1e-12)
+    else:
+        weight = (1.0 / lengths.double())[patient_idx]
+
+    if entry_weight is not None:
+        # Applied OUTSIDE the per-patient normalisation, deliberately.  Folded
+        # inside, a per-patient constant divides straight back out and does
+        # nothing at all -- a bug that looks exactly like "the entry weight had
+        # no effect".  Out here it scales the patient's TOTAL contribution, which
+        # is the point: it reweights *between* patients, while the decay term
+        # reweights *within* one.
+        weight = weight * entry_weight.to(weight.dtype)[patient_idx]
 
     return x_exp, s_exp, patient_idx, weight
 

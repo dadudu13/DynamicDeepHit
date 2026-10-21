@@ -249,3 +249,80 @@ def test_proportional_init_hits_target_survival_exactly():
 def test_proportional_still_leaves_mass_outside_the_grid():
     total = torch.stack(_prop_model()(_batch())[1]).sum(0).sum(1)
     assert (total < 1.0).all()
+
+
+# ---------------------------------------------------------------- landmark decay
+
+def _prefix_weights(days, decay=None):
+    """Weights build_landmark_prefixes assigns to one patient's landmarks."""
+    from ddh.losses import build_landmark_prefixes
+    n_visits = len(days)
+    x = torch.zeros(1, n_visits, D, dtype=torch.float64)
+    s_all = torch.zeros(1, n_visits, dtype=torch.long)
+    vd = torch.tensor([days], dtype=torch.float64)
+    _, _, _, w = build_landmark_prefixes(x, s_all, visit_days=vd, decay_days=decay)
+    return w
+
+
+def test_decay_reduces_to_uniform_when_disabled():
+    """decay_days=None must take the original 1/V_i path exactly."""
+    w = _prefix_weights([0.0, 30.0, 90.0, 400.0], decay=None)
+    assert torch.allclose(w, torch.full((4,), 0.25, dtype=torch.float64))
+
+
+def test_decay_still_sums_to_one_per_patient():
+    """The 1/V_i guarantee -- every patient contributes total weight 1 -- must
+    survive, so this redistributes attention within a patient, never between."""
+    for decay in (30.0, 180.0, 3650.0):
+        w = _prefix_weights([0.0, 30.0, 90.0, 400.0], decay=decay)
+        assert abs(w.sum().item() - 1.0) < 1e-12, decay
+
+
+def test_decay_puts_more_weight_on_earlier_landmarks():
+    w = _prefix_weights([0.0, 30.0, 90.0, 400.0], decay=180.0)
+    assert (w[:-1] > w[1:]).all(), w
+    assert w[0] > 0.25 > w[-1], "day 0 must gain and the latest visit must lose"
+
+
+def test_large_decay_converges_to_uniform():
+    """As decay_days -> inf every exponent is 0, so weights collapse to 1/V_i."""
+    w = _prefix_weights([0.0, 30.0, 90.0, 400.0], decay=1e9)
+    assert torch.allclose(w, torch.full((4,), 0.25, dtype=torch.float64), atol=1e-6)
+
+
+def test_decay_weights_by_day_not_visit_index():
+    """A quarterly-seen patient must be weighted differently from a weekly one
+    even though both have the same number of visits."""
+    weekly = _prefix_weights([0.0, 7.0, 14.0, 21.0], decay=180.0)
+    quarterly = _prefix_weights([0.0, 90.0, 180.0, 270.0], decay=180.0)
+    assert not torch.allclose(weekly, quarterly)
+    assert quarterly[0] > weekly[0], "the sparser schedule concentrates more on visit 1"
+
+
+def test_entry_weight_scales_total_contribution_between_patients():
+    """It must sit OUTSIDE the per-patient normalisation.
+
+    Folded inside, a per-patient constant divides straight back out and the
+    weight does nothing -- a silent no-op that looks like a null result.
+    """
+    from ddh.losses import build_landmark_prefixes
+    x = torch.zeros(2, 3, D, dtype=torch.float64)
+    s_all = torch.zeros(2, 3, dtype=torch.long)
+    vd = torch.tensor([[0., 30., 90.], [0., 30., 90.]], dtype=torch.float64)
+    ew = torch.tensor([1.5, 0.5], dtype=torch.float64)
+
+    _, _, pid, w = build_landmark_prefixes(x, s_all, visit_days=vd,
+                                           decay_days=180.0, entry_weight=ew)
+    tot = torch.tensor([w[pid == i].sum() for i in (0, 1)])
+    assert torch.allclose(tot, ew), f"per-patient totals {tot} should equal {ew}"
+    # shape within a patient is untouched -- only the level differs
+    assert torch.allclose(w[pid == 0] / 1.5, w[pid == 1] / 0.5)
+
+
+def test_entry_weight_applies_without_decay_too():
+    from ddh.losses import build_landmark_prefixes
+    x = torch.zeros(2, 2, D, dtype=torch.float64)
+    s_all = torch.zeros(2, 2, dtype=torch.long)
+    ew = torch.tensor([2.0, 0.25], dtype=torch.float64)
+    _, _, pid, w = build_landmark_prefixes(x, s_all, entry_weight=ew)
+    assert torch.allclose(torch.tensor([w[pid == i].sum() for i in (0, 1)]), ew)
