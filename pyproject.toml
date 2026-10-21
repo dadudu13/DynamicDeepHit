@@ -24,9 +24,11 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+# evaluation/ (training and evaluation scripts)
+eval = ["statsmodels", "scipy"]
 
 [tool.setuptools]
-packages = ["ddh"]
+packages = ["ddh", "evaluation"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
