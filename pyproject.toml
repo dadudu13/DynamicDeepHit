@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddh"
+version = "0.2.0"
+description = "Dynamic-DeepHit in PyTorch, extended for landmark-based dynamic prediction"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Vincent Jeanselme" }, { name = "Dulin Wang" }]
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "tqdm",
+    # Imported when auton-survival loads. auton-survival itself is installed
+    # with --no-deps (see README): its PyPI release pins torch<2.0.
+    "pandas",
+    "scikit-learn",
+    "scikit-survival",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["ddh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
