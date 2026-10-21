@@ -43,7 +43,8 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 						   alpha, beta, sigma, cause_weights,
 						   chunk_rows = 512, backward = False,
 						   visit_days_b = None, landmark_decay_days = None,
-						   entry_weight_b = None,
+						   entry_weight_b = None, landmark_row_weighting = "patient",
+						   row_weights_b = None, landmark_band_edges = None,
 						   gamma = 0.0, horizon_spec = None,
 						   component_totals = None):
 	"""
@@ -81,7 +82,8 @@ def all_landmark_objective(model, xb, tb, eb, sb, s_all_b,
 
 	x_exp, s_exp, patient_idx, weight = build_landmark_prefixes(
 		xb, s_all_b, visit_days = visit_days_b, decay_days = landmark_decay_days,
-		entry_weight = entry_weight_b)
+		entry_weight = entry_weight_b, row_weighting = landmark_row_weighting,
+		row_weights = row_weights_b, band_edges = landmark_band_edges)
 	t_exp, e_exp = tb.long()[patient_idx], eb.int()[patient_idx]
 
 	# The horizon term needs each row's landmark DAY (to locate the bin holding
@@ -133,6 +135,10 @@ def train_ddh(model,
 			  landmark_chunk_rows = 512,
 			  visit_days_valid = None,
 			  landmark_decay_days = None,
+			  landmark_row_weighting = "patient",
+			  row_weights_train = None,
+			  row_weights_valid = None,
+			  landmark_band_edges = None,
 			  entry_weight_train = None,
 			  entry_weight_valid = None,
 			  gamma = 0.0,
@@ -201,9 +207,10 @@ def train_ddh(model,
 
 		# The decay weighting needs per-visit days too, not just the augmenter.
 		visit_days_ep = None
-		if augment or landmark_decay_days is not None:
+		if augment or landmark_decay_days is not None or landmark_row_weighting == "band":
 			visit_days_ep = visit_days_train[perm]
 		entry_w_ep = entry_weight_train[perm] if entry_weight_train is not None else None
+		row_w_ep = row_weights_train[perm] if row_weights_train is not None else None
 		if augment:
 			x_ep, s_ep = _augment_landmark_truncation(x_ep, s_ep, visit_days_ep, split_time_tensor, landmark_augment_prob)
 
@@ -219,6 +226,7 @@ def train_ddh(model,
 			sb = s_ep[j : j + bs] if s_ep is not None else None
 			s_all_b = s_all_ep[j : j + bs] if s_all_ep is not None else None
 			visit_days_b = visit_days_ep[j : j + bs] if visit_days_ep is not None else None
+			row_w_b = row_w_ep[j : j + bs] if row_w_ep is not None else None
 			entry_w_b = entry_w_ep[j : j + bs] if entry_w_ep is not None else None
 
 			if xb.shape[0] == 0:
@@ -240,6 +248,9 @@ def train_ddh(model,
 									   chunk_rows = landmark_chunk_rows, backward = True,
 									   visit_days_b = visit_days_b,
 									   landmark_decay_days = landmark_decay_days,
+									   landmark_row_weighting = landmark_row_weighting,
+									   row_weights_b = row_w_b,
+									   landmark_band_edges = landmark_band_edges,
 									   entry_weight_b = entry_w_b,
 									   gamma = gamma, horizon_spec = horizon_spec,
 									   component_totals = epoch_parts)
@@ -288,6 +299,9 @@ def train_ddh(model,
 					chunk_rows = landmark_chunk_rows, backward = False,
 					visit_days_b = visit_days_b,
 					landmark_decay_days = landmark_decay_days,
+					landmark_row_weighting = landmark_row_weighting,
+					row_weights_b = row_weights_valid,
+					landmark_band_edges = landmark_band_edges,
 					entry_weight_b = entry_w_b,
 					gamma = gamma, horizon_spec = horizon_spec,
 				)
